@@ -1,8 +1,19 @@
 import os, json, math
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ['CUDA_VISIBLE_DEVICES']="0,1"
-os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:False'
+#os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+#os.environ['CUDA_VISIBLE_DEVICES']="0,1"
+#os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:False'
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ['HF_HOME'] = '/data_external/hf_cache'
+
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--start", type=int, required=True)
+parser.add_argument("--end", type=int, required=True)
+parser.add_argument("--device", type=str, required=True)
+args = parser.parse_args()
+os.environ['CUDA_VISIBLE_DEVICES']=args.device
+
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Union, Literal
 from dataclasses import dataclass
@@ -25,17 +36,17 @@ from tqdm import tqdm
 # =========================
 # Config
 # =========================
-MODEL_NAME              = '/wy_data/Qwen3-VL-8B-Instruct'
-TP_SIZE                 = int(os.environ.get("TP_SIZE", "2"))        # tensor parallel degree
+MODEL_NAME              = 'Qwen/Qwen3-VL-8B-Instruct'
+TP_SIZE                 = int(os.environ.get("TP_SIZE", "4"))        # tensor parallel degree
 DTYPE                   = os.environ.get("DTYPE", "bfloat16")         # "float16" or "bfloat16"
 MAX_MODEL_LEN           = int(os.environ.get("MAX_MODEL_LEN", "16384"))
-GPU_MEM_UTIL            = float(os.environ.get("GPU_MEM_UTIL", "0.5"))
+GPU_MEM_UTIL            = float(os.environ.get("GPU_MEM_UTIL", "0.3"))
 TEMPERATURE             = 1.0
 TOPK_LOGPROB            = 32           # store top-K per position
 STORE_PER_EVIDENCE      = False        # set True to also store per-evidence top-K (large!)
 EVIDENCE_BATCH_SIZE     = 30           # vLLM batch over evidences per query (set to <= K)
-MACRO_BATCH_SIZE        = 12
-SAVE_DIR                = '/wy_data/SKVQA/DataStore_rep/'
+MACRO_BATCH_SIZE        = 48
+SAVE_DIR                = '/data_external/InfoSeek/DataStore_rep/'
 USE_UNION_TOPK_FOR_MIX  = True         # union-of-topK across evidences to compute mixture
 DEVICE                  = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -108,6 +119,7 @@ class ImageUUIDLRU:
 
 
 def load_image(path: str) -> Image.Image:
+    path = path.replace('wy_data', 'data_external')
     img = Image.open(path).convert("RGB")
     return img
 
@@ -148,7 +160,7 @@ def build_two_image_requests(prompt: str, image1_path: Union[str, Image.Image], 
     return requests
 
 
-def process_input(question, answer, image, ret_images, tokenizer=None, uuid_cache:ImageUUIDLRU=None, mode:Literal['augment', 'replace']='augment')->list[TextPrompt]:
+def process_input(question, answer, image, ret_images:list[str], tokenizer=None, uuid_cache:ImageUUIDLRU=None, mode:Literal['augment', 'replace']='augment')->list[TextPrompt]:
 
     if mode == 'augment':
         prompt_teacher = "Answer the image related question. Be concise, output the answer only, without any additional words. An additional image is provided for your reference, but it is not guaranteed to be relevant to original question."
@@ -252,7 +264,7 @@ def build_llm():
     llm = LLM(
         model=MODEL_NAME,
         dtype=DTYPE,
-        tensor_parallel_size=TP_SIZE,
+        tensor_parallel_size=1,
         max_model_len=MAX_MODEL_LEN,
         max_logprobs=32,
         gpu_memory_utilization=GPU_MEM_UTIL,
@@ -475,11 +487,12 @@ def build_cache(dataset_iter, out_dir: str, prebuild_index:list[dict]):
     payload_buffer = []
     buffer_step = 0
     for step, (sample, ret_obj) in tqdm(enumerate(zip(dataset_iter, prebuild_index)), total=len(dataset_iter)):
-        assert sample['question_id'] == ret_obj['question_id']
-        qid = sample['question_id']
+        assert sample['data_id'] == ret_obj['question_id']
+        qid = sample['data_id']
         question_text = sample['question']
-        question_image = sample['image']
-        answer = ast.literal_eval(sample['answer'])
+        question_image = sample['image_id']
+        #answer = ast.literal_eval(sample['answer'])
+        answer = sample['answer']
         answer = max(answer, key=len)
         answer_eos = answer + tokenizer.eos_token
         answer_ids = tokenizer.encode(answer_eos)
@@ -616,13 +629,18 @@ if __name__ == "__main__":
     # build_cache(dataset_iter(), SAVE_DIR)
 
     
-    train_ds = datasets.load_from_disk('/wy_data/SKVQA/IRCAP/train')
-    test_ds = datasets.load_from_disk('/wy_data/SKVQA/IRCAP/test')
+    #train_ds = datasets.load_from_disk('/data_external/InfoSeek/train')
+    #test_ds = datasets.load_from_disk('/data_external/InfoSeek/test')
+
+
+
+    with open('/data_external/InfoSeek/infoseek_train.jsonl') as f:
+        train_ds = [json.loads(e) for e in f.readlines()]
 
     # train_ds = train_ds.cast_column("image", HFImage(decode=True))
     # test_ds = test_ds.cast_column("image", HFImage(decode=True))
-    with open('/wy_data/SKVQA/IRCAP/query_ret_imgs.jsonl') as f:
+    with open('/data_external/InfoSeek/query_ret_imgs.jsonl') as f:
         prebuild_index = [json.loads(e) for e in f.readlines()]
-    train_ds = train_ds.select(range(50000,len(prebuild_index)))
-    prebuild_index = prebuild_index[50000:]
+    train_ds = train_ds[args.start:args.end]
+    prebuild_index = prebuild_index[args.start:args.end]
     build_cache(dataset_iter=train_ds, out_dir=SAVE_DIR, prebuild_index=prebuild_index)

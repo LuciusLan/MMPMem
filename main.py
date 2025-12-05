@@ -1,11 +1,13 @@
 import argparse
 import os
-os.environ['CUDA_VISIBLE_DEVICES']="0,1"
-os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
+os.environ['HF_HOME'] = '/data_external/hf_cache'
+os.environ['CUDA_VISIBLE_DEVICES']="0,1,2,3"
+#os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
 from typing import List, Tuple, Iterable
 from transformers.feature_extraction_utils import BatchFeature
 from glob import glob
 import ast
+import json
 import random
 
 import numpy as np
@@ -20,13 +22,14 @@ import torch.nn.functional as F
 from transformers import AutoModel, Qwen3VLForConditionalGeneration, CLIPModel, CLIPProcessor, AutoProcessor, Qwen3VLProcessor
 import datasets
 import wandb
-from qwen_vl_utils import process_vision_info
+#from qwen_vl_utils import process_vision_info
 from modelling_memory import MemoryMLP
 from inference import generate_with_memory
-from eval_util import score_docvqa_like
+from eval_util import score_infoseek
 
-from accelerate import dispatch_model, infer_auto_device_map
-from tqdm import tqdm
+from accelerate import dispatch_model, infer_auto_device_map, Accelerator
+from accelerate.utils import tqdm
+#from tqdm import tqdm
 
 # ---------------------------
 # Hyperparameters & utilities
@@ -38,7 +41,7 @@ KL_WEIGHT = 1.0           # weight for teacher KL
 USE_RESIDUAL = False       # if True: memory learns residual logits; else memory outputs a dist directly
 HID_LAYER_ID = 29
 EPS = 1e-12
-MACRO_BATCH_SIZE = 64
+MACRO_BATCH_SIZE = 20
 
 
 
@@ -170,7 +173,8 @@ def train_step(model, memory, optimizer, device, base_inputs: BatchFeature, inpu
         #h_ans = h_ans.to(memory.device)
         mem_logits = memory(h_ans)                               # [B, La_max, V]
         #final_logits = base_ans_logits + eta * mem_logits        # [B, La_max, V]
-        final_logits = base_ans_logits + mem_logits 
+        #final_logits = base_ans_logits + mem_logits 
+        final_logits = mem_logits
 
         # ----- CE over gold answer tokens (masking padding) -----
         mask_flat = answer_mask.view(-1)                         # [B*La_max]
@@ -252,14 +256,18 @@ def process_input_test(processor, question, qimg, ret_image=None):
         ]
 
     # Preparation for inference
-    inputs = processor.apply_chat_template(
+    text_inputs = processor.apply_chat_template(
         messages,
-        tokenize=True,
+        tokenize=False,
         add_generation_prompt=True,
-        return_dict=True,
-        padding=True, 
-        return_tensors="pt"
+        #return_dict=True,
+        #padding=True, 
+        #return_tensors="pt"
         )
+    
+    inputs = processor(images=qimg, text=text_inputs, padding=True, return_tensors='pt')
+    #inputs.pop("token_type_ids", None)   # per model card snippet
+    #inputs = inputs.to(teacher.device)
     return inputs
     
 def process_input(processor, questions, qimgs, answers, ret_image=None):
@@ -349,88 +357,99 @@ def process_teacher_batch(mix_idx, mix_logp, tail_logp, answer_lengths:list[int]
 
 
 def main():
+    
 
-    #train_ds = datasets.load_from_disk('/wy_data/SKVQA/IRCAP/train')
-    train_ds = datasets.load_from_disk('/wy_data/SKVQA/IRCAP/train_combined').with_format('torch')
+    train_ds = datasets.load_from_disk('/data_external/InfoSeek/train_combined').with_format('torch')
     #train_ds = train_ds.cast_column("image", HFImage(decode=True))
     #train_ds = train_ds.select(range(100000))
-    test_ds = datasets.load_from_disk('/wy_data/SKVQA/IRCAP/test')
+    test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_combined').with_format('torch')
 
 
-    model = Qwen3VLForConditionalGeneration.from_pretrained("/wy_data/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16, device_map=None)
+    model = Qwen3VLForConditionalGeneration.from_pretrained("Qwen/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16, device_map='cpu')
 
-    device_map = infer_auto_device_map(
-        model,
-        max_memory={0: "10GiB", 1: "10GiB"},  # adapt to your hardware
-        no_split_module_classes=["Qwen3VLTextDecoderLayer"],  # example
-    )
-    model = dispatch_model(model, device_map=device_map)
+    # device_map = infer_auto_device_map(
+    #     model,
+    #     max_memory={0: "10GiB", 1: "10GiB"},  # adapt to your hardware
+    #     no_split_module_classes=["Qwen3VLTextDecoderLayer"],  # example
+    # )
+    # model = dispatch_model(model, device_map=device_map)
     for p in model.parameters():
         p.requires_grad_(False)
-    #teacher = Qwen2_5_VLForConditionalGeneration.from_pretrained("/wy_data/qwen2.5_vl_7b_instruct", local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16).cuda()
-    processor = AutoProcessor.from_pretrained('/wy_data/Qwen3-VL-8B-Instruct')
+    #teacher = Qwen2_5_VLForConditionalGeneration.from_pretrained("/data_external/qwen2.5_vl_7b_instruct", local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16).cuda()
+    processor = AutoProcessor.from_pretrained('Qwen/Qwen3-VL-8B-Instruct')
 
-    #retriever = AutoModel.from_pretrained("/wy_data/bge_vl_large", trust_remote_code=True, local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16, device_map='cuda')
+    #retriever = AutoModel.from_pretrained("/data_external/bge_vl_large", trust_remote_code=True, local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16, device_map='cuda')
     #retriever = retriever.cuda()
-    #retriever.set_processor("/wy_data/bge_vl_large")
+    #retriever.set_processor("/data_external/bge_vl_large")
     memory = MemoryMLP()
-    memory_device_map = {
-        "blocks.0": "cuda:0",
-        "blocks.1": "cuda:0",
-        "blocks.2": "cuda:0",
-        "blocks.3": "cuda:0",
-        "blocks.4": "cuda:1",
-        "head": "cuda:1"
-    }
-    memory = dispatch_model(memory, device_map=memory_device_map)
+    # memory_device_map = {
+    #     "blocks.0": "cuda:0",
+    #     "blocks.1": "cuda:0",
+    #     "blocks.2": "cuda:0",
+    #     "blocks.3": "cuda:0",
+    #     "blocks.4": "cuda:1",
+    #     "head": "cuda:1"
+    # }
+    # memory = dispatch_model(memory, device_map=memory_device_map)
     #memory = memory.to('cuda:1')
     #total_params = sum(p.numel() for p in memory.parameters())
-    #index = faiss.read_index('/wy_data/MRAG/bge.index')
+    #index = faiss.read_index('/data_external/MRAG/bge.index')
 
     # Optional: learnable global scale for how much to trust memory residual
     #eta = torch.nn.Parameter(torch.tensor(0.5, device=device))
-    optimizer = torch.optim.AdamW(list(memory.parameters()), lr=1e-5)
-
-
-    #saved_dict = torch.load('/wy_data/MMMem/checkpoints/12.pt')
-    #memory.load_state_dict(saved_dict, strict=True)
-    wandb_run = wandb.init(project="MMMem", name="same_teacher_replace")
-
-    model.eval()
-    memory.eval()
-    correct =0
-    cb = 0
-    all_gt = []
-    all_pred =  []
-    all_pred_base = []
-    for row in tqdm(test_ds.select(range(1000))):
-        question = row['question']
-        qimg = row['image']
-        #answer_id = row['answer']
-        #answer_id = processor.tokenizer.encode(answer_id)
-        base_inputs = process_input_test(processor, question, qimg).to(model.device)
-        with torch.inference_mode():
-            gid, text, text_base = generate_with_memory(model, memory, processor.tokenizer, base_inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=1.)
-        #answer_first = answer_id[0]
-        #correct += processor.tokenizer._convert_id_to_token(answer_first).lower() == processor.tokenizer._convert_id_to_token(gid.item()).lower()
-
-        gt = ast.literal_eval(row['answer'])
-        #correct += gt.lower() == text.lower()
-        score = score_docvqa_like(text_base, gt)
-        cb += score['anls']
-        #cb += gt.lower() == text_base.lower()
-        all_gt.append(gt)
-        all_pred.append(text)
-        all_pred_base.append(text_base)
-
-    print(f"Ep -1: val acc: {correct/1000} | val base: {cb/1000}")
-    wandb_run.log({'eval/acc': cb/1000, 'eval/epoch': 0})
-    # 27.896
-
+    optimizer = torch.optim.AdamW(list(memory.parameters()), lr=1e-4)
+    
     def collate(x):
         return {k: [e[k] for e in x] for k in x[0].keys()}
 
-    train_ds = DataLoader(train_ds, batch_size=8, shuffle=True, collate_fn=collate, num_workers=0,) #prefetch_factor=2,)
+    train_ds = DataLoader(train_ds, batch_size=MACRO_BATCH_SIZE, shuffle=True, collate_fn=collate, num_workers=4, prefetch_factor=2,)
+    test_ds = DataLoader(test_ds, batch_size=1, collate_fn=collate)
+
+    accel = Accelerator()
+    model, memory, optimizer, train_ds, test_ds = accel.prepare(model, memory, optimizer, train_ds, test_ds)
+
+    #saved_dict = torch.load('/data_external/MMMem/checkpoints/12.pt')
+    #memory.load_state_dict(saved_dict, strict=True)
+
+    if accel.is_main_process:
+        wandb_run = wandb.init(project="MMMem", name="same_teacher_replace")
+
+    # model.eval()
+    # memory.eval()
+    # correct =0
+    # cb = 0
+    # all_gt = []
+    # all_pred =  []
+    # all_pred_base = []
+    # for row in tqdm(test_ds):
+    #     question = row['question']
+    #     qimg = row['image']
+    #     #answer_id = row['answer']
+    #     #answer_id = processor.tokenizer.encode(answer_id)
+    #     base_inputs = process_input_test(processor, question, qimg).to(model.device)
+    #     with torch.inference_mode():
+    #         gid, text, text_base = generate_with_memory(model, memory, processor.tokenizer, base_inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=1.)
+    #     #answer_first = answer_id[0]
+    #     #correct += processor.tokenizer._convert_id_to_token(answer_first).lower() == processor.tokenizer._convert_id_to_token(gid.item()).lower()
+
+    #     # gt = ast.literal_eval(row['answer_eval'])
+    #     gt = row['answer_eval']
+    #     if '{' in gt[0] and '}' in gt[0]:
+    #             gt = ast.literal_eval(gt[0])
+    #     #correct += gt.lower() == text.lower()
+    #     score = score_infoseek(text_base, gt)
+    #     cb += score['acc']
+    #     #cb += gt.lower() == text_base.lower()
+    #     all_gt.append(gt)
+    #     all_pred.append(text)
+    #     all_pred_base.append(text_base)
+
+    # print(f"Ep -1: val acc: {correct/1000} | val base: {cb/1000}")
+    if accel.is_main_process:
+        wandb_run.log({'eval/acc': 14.4, 'eval/epoch': 0})
+    # 14.90
+
+
     for ep in range(20):
         model.eval()
         memory.train()
@@ -446,12 +465,12 @@ def main():
             question = row['question']
             qimg = row['image']
             answers = row['answer']
-            answers = [ast.literal_eval(answer) for answer in answers]
+            #answers = [ast.literal_eval(answer) for answer in answers]
             longest_answers = [max(answer, key=len)+processor.tokenizer.eos_token for answer in answers]
-            qid = row['question_id']
+            qid = row['data_id']
 
             # try:
-            #     teacher_logits = torch.load(f'/wy_data/SKVQA/DataStore_rep/{qid}.pt')
+            #     teacher_logits = torch.load(f'/data_external/SKVQA/DataStore_rep/{qid}.pt')
             # except FileNotFoundError:
             #     #print(f'qid{qid} teacher logit not found')
             #     continue
@@ -479,16 +498,23 @@ def main():
             cur_loss = np.mean(acc_loss)
             pbar.set_postfix({"Loss": cur_loss})
             pbar.update()
+            if accel.is_main_process:
+                log_dict = {
+                    "train/epoch": ep + 1,
+                    "train/step": ep * len(train_ds) + step,
+                    "train/loss": stats['loss'],
+                    "train/ce_loss": stats['ce'],
+                    "train/kl_loss": stats['kl'],
+                }
+                wandb_run.log(log_dict)
+            if step%30 == 0:
+                torch.cuda.empty_cache()
 
-            log_dict = {
-                "train/epoch": ep + 1,
-                "train/step": ep * len(train_ds) + step,
-                "train/loss": stats['loss'],
-                "train/ce_loss": stats['ce'],
-                "train/kl_loss": stats['kl'],
-            }
-            wandb_run.log(log_dict)
-
+        accel.wait_for_everyone()
+        state = accel.get_state_dict(memory)         # gathered on rank 0, offloaded to CPU
+        if accel.is_main_process:
+            torch.save(state, f"/data_external/MMMem/checkpoints/{ep}.pt")
+        accel.wait_for_everyone()
 
         model.eval()
         memory.eval()
@@ -496,8 +522,8 @@ def main():
         em = 0
         cb = 0
         eb = 0
-        for row in tqdm(test_ds.select(range(1000))):
-            question = row['question']
+        for row in tqdm(test_ds):
+            question = row['question'][0]
             qimg = row['image']
             #answer_id = row['answer']
             #answer_id = processor.tokenizer.encode(answer_id)
@@ -507,28 +533,30 @@ def main():
             #answer_first = answer_id[0]
             #correct += processor.tokenizer._convert_id_to_token(answer_first).lower() == processor.tokenizer._convert_id_to_token(gid.item()).lower()
 
-            gt = ast.literal_eval(row['answer'])
+            #gt = ast.literal_eval(row['answer'])
+            gt = row['answer_eval'][0]
+            if '{' in gt[0] and '}' in gt[0]:
+                    gt = ast.literal_eval(gt[0])
             #correct += gt.lower() == text.lower()
-            score = score_docvqa_like(text_base, gt)
             #cb += gt.lower() == text_base.lower()
-            all_gt.append(gt)
-            all_pred.append(text)
-            all_pred_base.append(text_base)
-            score = score_docvqa_like(text, gt)
-            sb = score_docvqa_like(text_base, gt)
-            correct += score['anls']
-            em += score['em']
-            cb += sb['anls']
-            eb += sb['em']
+            # all_gt.append(gt)
+            # all_pred.append(text)
+            # all_pred_base.append(text_base)
+            score = score_infoseek(text, gt)
+            sb = score_infoseek(text_base, gt)
+            correct += score['acc']
+            #em += score['em']
+            cb += sb['acc']
+            #eb += sb['em']
         
-        states = memory.state_dict()
-        torch.save(states, f"/wy_data/MMMem/checkpoints/{ep}.pt")
+
         print(f"Ep {ep}: val acc: {correct/1000} | val em: {em/1000}")
-        wandb_run.log({'eval/acc': correct/1000})
-        wandb_run.log({'eval/em': em/1000})
-        wandb_run.log({'eval/acc_base': cb/1000})
-        wandb_run.log({'eval/em_base': eb/1000})
-        wandb_run.log({'eval/epoch': ep+1})
+        if accel.is_main_process:
+            wandb_run.log({'eval/acc': correct/1000})
+            #wandb_run.log({'eval/em': em/1000})
+            wandb_run.log({'eval/acc_base': cb/1000})
+            #wandb_run.log({'eval/em_base': eb/1000})
+            wandb_run.log({'eval/epoch': ep+1})
 
 
 if __name__ == "__main__":
