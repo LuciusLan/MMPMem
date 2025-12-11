@@ -1,8 +1,8 @@
 import argparse
 import os
 os.environ['HF_HOME'] = '/data_external/hf_cache'
-os.environ['CUDA_VISIBLE_DEVICES']="0,1,2,3"
-#os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
+os.environ['CUDA_VISIBLE_DEVICES']="1,2"
+os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
 from typing import List, Tuple, Iterable
 from transformers.feature_extraction_utils import BatchFeature
 from glob import glob
@@ -17,6 +17,7 @@ from datasets import Image as HFImage
 
 #import faiss
 import torch
+from torch import nn
 from torch.utils.data import DataLoader, Dataset
 import torch.nn.functional as F
 from transformers import AutoModel, Qwen3VLForConditionalGeneration, CLIPModel, CLIPProcessor, AutoProcessor, Qwen3VLProcessor
@@ -41,7 +42,7 @@ KL_WEIGHT = 1.0           # weight for teacher KL
 USE_RESIDUAL = False       # if True: memory learns residual logits; else memory outputs a dist directly
 HID_LAYER_ID = 29
 EPS = 1e-12
-MACRO_BATCH_SIZE = 20
+MACRO_BATCH_SIZE = 16
 
 
 
@@ -128,7 +129,7 @@ def memory_forward(memory, h):
 # ---------------------------
 # Single-sample training step
 # ---------------------------
-def train_step(model, memory, optimizer, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, teacher_ids:torch.Tensor, teacher_logprob:torch.Tensor, tail_logprob:torch.Tensor):
+def train_step(model:Qwen3VLForConditionalGeneration, memory:nn.Module, optimizer, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, teacher_ids:torch.Tensor, teacher_logprob:torch.Tensor, tail_logprob:torch.Tensor):
     memory.train()
     optimizer.zero_grad(set_to_none=True)
 
@@ -146,14 +147,14 @@ def train_step(model, memory, optimizer, device, base_inputs: BatchFeature, inpu
         _, La_max = answer_ids.shape
 
         # ----- base model forward, frozen -----
-        out = model(
+        out = model.forward(
             **base_inputs,
             output_hidden_states=True,
         )
-        logits = out["logits"].detach()             # [B, L_full_max, V]
+        #logits = out["logits"].detach()             # [B, L_full_max, V]
         hidden = out["hidden_states"][-1].detach()  # [B, L_full_max, H] (or choose another layer)
 
-        B, L_full_max, V = logits.shape
+        B, L_full_max, V = out["logits"].shape
         H = hidden.size(-1)
 
         # ----- gather per-answer-step logits and hidden states -----
@@ -162,10 +163,10 @@ def train_step(model, memory, optimizer, device, base_inputs: BatchFeature, inpu
         j_pos = torch.arange(La_max, device=device).unsqueeze(0).expand(B, -1)          # [B, La_max]
         t_indices = (input_lengths.unsqueeze(1) - 1 + j_pos).clamp(0, L_full_max - 1)  # [B, La_max]
 
-        idx_logits = t_indices.unsqueeze(-1).expand(-1, -1, V)   # [B, La_max, V]
+        #idx_logits = t_indices.unsqueeze(-1).expand(-1, -1, V)   # [B, La_max, V]
         idx_hidden = t_indices.unsqueeze(-1).expand(-1, -1, H)   # [B, La_max, H]
 
-        base_ans_logits = logits.gather(1, idx_logits)           # [B, La_max, V]
+        #base_ans_logits = logits.gather(1, idx_logits)           # [B, La_max, V]
         h_ans = hidden.gather(1, idx_hidden)                     # [B, La_max, H]
 
         # ----- memory forward and final logits -----
@@ -219,8 +220,8 @@ def train_step(model, memory, optimizer, device, base_inputs: BatchFeature, inpu
         }
     return stats
 
-prompt_base = "Answer the image related question. Be concise, output the answer only, without any additional words."
-prompt_teacher = "Answer the image related question. Be concise, output the answer only, without any additional words. An additional image is provided for your reference, but it is not guaranteed to be relevant to original question."
+prompt_base = "Answer the image related question. For many fact checking questions, the desired answer would be named entities instead of common concept, for example \"Mount Everest\" instead of \"mountain top\". Be concise, output the answer only, without any additional words."
+prompt_teacher = "Answer the image related question. For many fact checking questions, the desired answer would be named entities instead of common concept, for example \"Mount Everest\" instead of \"mountain top\". Be concise, output the answer only, without any additional words. An additional image is provided for your reference, but it is not guaranteed to be relevant to original question."
 
 def process_input_test(processor, question, qimg, ret_image=None):
 
@@ -408,45 +409,49 @@ def main():
     accel = Accelerator()
     model, memory, optimizer, train_ds, test_ds = accel.prepare(model, memory, optimizer, train_ds, test_ds)
 
-    #saved_dict = torch.load('/data_external/MMMem/checkpoints/12.pt')
+    #saved_dict = torch.load('/data_external/MMPMem/checkpoints/12.pt')
     #memory.load_state_dict(saved_dict, strict=True)
 
     if accel.is_main_process:
         wandb_run = wandb.init(project="MMMem", name="same_teacher_replace")
 
-    # model.eval()
-    # memory.eval()
-    # correct =0
-    # cb = 0
-    # all_gt = []
-    # all_pred =  []
-    # all_pred_base = []
-    # for row in tqdm(test_ds):
-    #     question = row['question']
-    #     qimg = row['image']
-    #     #answer_id = row['answer']
-    #     #answer_id = processor.tokenizer.encode(answer_id)
-    #     base_inputs = process_input_test(processor, question, qimg).to(model.device)
-    #     with torch.inference_mode():
-    #         gid, text, text_base = generate_with_memory(model, memory, processor.tokenizer, base_inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=1.)
-    #     #answer_first = answer_id[0]
-    #     #correct += processor.tokenizer._convert_id_to_token(answer_first).lower() == processor.tokenizer._convert_id_to_token(gid.item()).lower()
+    model.eval()
+    memory.eval()
+    correct = torch.tensor(0., device=model.device)
+    cb = torch.tensor(0., device=model.device)
+    all_gt = []
+    all_pred =  []
+    all_pred_base = []
+    for row in tqdm(test_ds):
+        question = row['question'][0]
+        qimg = row['image']
+        #answer_id = row['answer']
+        #answer_id = processor.tokenizer.encode(answer_id)
+        base_inputs = process_input_test(processor, question, qimg).to(model.device)
+        with torch.inference_mode():
+            gid, text, text_base = generate_with_memory(model, memory, processor.tokenizer, base_inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=1.)
+        #answer_first = answer_id[0]
+        #correct += processor.tokenizer._convert_id_to_token(answer_first).lower() == processor.tokenizer._convert_id_to_token(gid.item()).lower()
 
-    #     # gt = ast.literal_eval(row['answer_eval'])
-    #     gt = row['answer_eval']
-    #     if '{' in gt[0] and '}' in gt[0]:
-    #             gt = ast.literal_eval(gt[0])
-    #     #correct += gt.lower() == text.lower()
-    #     score = score_infoseek(text_base, gt)
-    #     cb += score['acc']
-    #     #cb += gt.lower() == text_base.lower()
-    #     all_gt.append(gt)
-    #     all_pred.append(text)
-    #     all_pred_base.append(text_base)
+        # gt = ast.literal_eval(row['answer_eval'])
+        gt = row['answer_eval'][0]
+        if '{' in gt[0] and '}' in gt[0]:
+            gt = ast.literal_eval(gt[0])
+        #correct += gt.lower() == text.lower()
+        score = score_infoseek(text_base, gt)
+        cb += score['acc']
+        #cb += gt.lower() == text_base.lower()
+        all_gt.append(gt)
+        all_pred.append(text)
+        all_pred_base.append([question, gt, text_base])
 
-    # print(f"Ep -1: val acc: {correct/1000} | val base: {cb/1000}")
+    # print(f"Ep -1: val acc: {cb/1000} | val base: {cb/1000}")
+    accel.wait_for_everyone()
+    xx = accel.gather(cb)
+    cb = accel.reduce(cb, reduction="sum").item()
+    
     if accel.is_main_process:
-        wandb_run.log({'eval/acc': 14.4, 'eval/epoch': 0})
+        wandb_run.log({'eval/acc': cb/1000, 'eval/epoch': 0})
     # 14.90
 
 
@@ -513,14 +518,14 @@ def main():
         accel.wait_for_everyone()
         state = accel.get_state_dict(memory)         # gathered on rank 0, offloaded to CPU
         if accel.is_main_process:
-            torch.save(state, f"/data_external/MMMem/checkpoints/{ep}.pt")
+            torch.save(state, f"/data_external/MMPMem/checkpoints/{ep}.pt")
         accel.wait_for_everyone()
 
         model.eval()
         memory.eval()
-        correct =0
+        correct =torch.tensor(0., device=model.device)
         em = 0
-        cb = 0
+        cb = torch.tensor(0., device=model.device)
         eb = 0
         for row in tqdm(test_ds):
             question = row['question'][0]
@@ -551,6 +556,9 @@ def main():
         
 
         print(f"Ep {ep}: val acc: {correct/1000} | val em: {em/1000}")
+        accel.wait_for_everyone()
+        correct = accel.reduce(correct, reduction="sum").item()
+        cb = accel.reduce(cb, reduction="sum").item()
         if accel.is_main_process:
             wandb_run.log({'eval/acc': correct/1000})
             #wandb_run.log({'eval/em': em/1000})

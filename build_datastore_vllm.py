@@ -1,19 +1,17 @@
-import os, json, math
-#os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-#os.environ['CUDA_VISIBLE_DEVICES']="0,1"
-#os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:False'
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ['HF_HOME'] = '/data_external/hf_cache'
-
-import argparse
+import os, json, math, argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--start", type=int, required=True)
-parser.add_argument("--end", type=int, required=True)
-parser.add_argument("--device", type=str, required=True)
+parser.add_argument('--start', type=int)
+parser.add_argument('--end',type=int)
+parser.add_argument('--device', type=str)
 args = parser.parse_args()
+from multiprocessing import Process
+#os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ['CUDA_VISIBLE_DEVICES']=args.device
-
+os.environ["HF_HOME"]='/data_external/hf_cache'
+os.environ['VLLM_FLASH_ATTN_VERSION']="2"
+os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
+# os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Union, Literal
 from dataclasses import dataclass
@@ -28,7 +26,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoConfig
 from PIL import Image
 import datasets
-from datasets import Image as HFImage
+from datasets import Image as HFImage, Dataset as HFDataset
 from vllm import LLM, SamplingParams
 from vllm.inputs.data import TextPrompt
 from tqdm import tqdm
@@ -37,15 +35,15 @@ from tqdm import tqdm
 # Config
 # =========================
 MODEL_NAME              = 'Qwen/Qwen3-VL-8B-Instruct'
-TP_SIZE                 = int(os.environ.get("TP_SIZE", "4"))        # tensor parallel degree
+TP_SIZE                 = int(os.environ.get("TP_SIZE", "2"))        # tensor parallel degree
 DTYPE                   = os.environ.get("DTYPE", "bfloat16")         # "float16" or "bfloat16"
 MAX_MODEL_LEN           = int(os.environ.get("MAX_MODEL_LEN", "16384"))
-GPU_MEM_UTIL            = float(os.environ.get("GPU_MEM_UTIL", "0.3"))
+GPU_MEM_UTIL            = float(os.environ.get("GPU_MEM_UTIL", "0.9"))
 TEMPERATURE             = 1.0
 TOPK_LOGPROB            = 32           # store top-K per position
 STORE_PER_EVIDENCE      = False        # set True to also store per-evidence top-K (large!)
 EVIDENCE_BATCH_SIZE     = 30           # vLLM batch over evidences per query (set to <= K)
-MACRO_BATCH_SIZE        = 48
+MACRO_BATCH_SIZE        = 20
 SAVE_DIR                = '/data_external/InfoSeek/DataStore_rep/'
 USE_UNION_TOPK_FOR_MIX  = True         # union-of-topK across evidences to compute mixture
 DEVICE                  = "cuda" if torch.cuda.is_available() else "cpu"
@@ -73,14 +71,23 @@ class MinimumDS(Dataset):
     def __len__(self):
         return len(self.samples)
     
-    def __getitem__(self, indices: Union[list, int]):
-        if isinstance(indices, list):
-            if isinstance(indices[0], int):
-                return [load_image(self.samples[idx]) for idx in indices]
-            else:
-                raise TypeError("Wrong indices passed from dataloader")
-        elif isinstance(indices, int):
-            return load_image(self.samples[indices])
+    def _load_one(self, path):
+        if 'wy_data' in path:
+            path = path.replace('wy_data', 'data_external')
+        img = Image.open(path).convert("RGB")
+        # if self.transform is not None:
+        #     img = self.transform(img)
+        return img
+
+    def __getitem__(self, idx):
+        row = self.samples[idx]
+        paths = row["ret_images"]  # list of 20 paths
+        imgs = [self._load_one(p) for p in paths]  # sequential per row
+        # e.g. stack to (20, C, H, W)
+        #imgs = torch.stack(imgs, dim=0)
+        row['ret_images_path'] = paths
+        row['ret_images'] = imgs
+        return row  # plus any labels/metadata you need
         
 def pil_content_hash(img: Image.Image) -> str:
     """Deterministic hash of pixel data (ignores EXIF/metadata)."""
@@ -119,8 +126,9 @@ class ImageUUIDLRU:
 
 
 def load_image(path: str) -> Image.Image:
-    path = path.replace('wy_data', 'data_external')
-    img = Image.open(path).convert("RGB")
+    img = Image.open(path)
+    if img.mode not in ['RGB', 'RGBA']:
+        img = img.convert("RGB")
     return img
 
 def dataset_iter_dummy():
@@ -160,10 +168,10 @@ def build_two_image_requests(prompt: str, image1_path: Union[str, Image.Image], 
     return requests
 
 
-def process_input(question, answer, image, ret_images:list[str], tokenizer=None, uuid_cache:ImageUUIDLRU=None, mode:Literal['augment', 'replace']='augment')->list[TextPrompt]:
+def process_input(question, answer, image, ret_images, tokenizer=None, uuid_cache:ImageUUIDLRU=None, mode:Literal['augment', 'replace']='augment')->list[TextPrompt]:
 
     if mode == 'augment':
-        prompt_teacher = "Answer the image related question. Be concise, output the answer only, without any additional words. An additional image is provided for your reference, but it is not guaranteed to be relevant to original question."
+        prompt_teacher = "Answer the image related question. For many fact checking questions, the desired answer would be named entities instead of common concept, for example \"Mount Everest\" instead of \"mountain top\", \"River Thames\" instead of \"river\". Be concise, output the answer only, without any additional words. An additional image is provided for your reference, but it is not guaranteed to be relevant to original question."
         messages = [
             {
                 "role": "user",
@@ -188,7 +196,7 @@ def process_input(question, answer, image, ret_images:list[str], tokenizer=None,
             }
         ]
     elif mode == 'replace':
-        prompt_teacher = "Answer the image related question. Be concise, output the answer only, without any additional words."
+        prompt_teacher = "Answer the image related question. For many fact checking questions, the desired answer would be named entities instead of common concept, for example \"Mount Everest\" instead of \"mountain top\", \"River Thames\" instead of \"river\". Be concise, output the answer only, without any additional words."
         messages = [
             {
                 "role": "user",
@@ -265,6 +273,8 @@ def build_llm():
         model=MODEL_NAME,
         dtype=DTYPE,
         tensor_parallel_size=1,
+        max_num_batched_tokens=55000,
+        #max_num_seqs=150,
         max_model_len=MAX_MODEL_LEN,
         max_logprobs=32,
         gpu_memory_utilization=GPU_MEM_UTIL,
@@ -283,8 +293,8 @@ def build_sampling_params(max_new_tokens: int, topk_prompt: int) -> SamplingPara
         prompt_logprobs=topk_prompt,         # <- crucial: top-K logprobs for each prompt token
         detokenize=False,
         allowed_token_ids=list(range(VOCAB_SIZE)),
-        repetition_penalty=1.0,
-        presence_penalty=1.5
+        #repetition_penalty=1.0,
+        #presence_penalty=1.5
     )
 
 # =========================
@@ -463,9 +473,9 @@ def save_payload(save_dir: Path, qid: str, payload: Dict[str, Any]):
 # Main caching procedure
 # =========================
 
-def build_cache(dataset_iter, out_dir: str, prebuild_index:list[dict]):
+def build_cache(dataset_iter, out_dir: str, prebuild_index:list[dict]=None):
     save_dir = Path(out_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
+    #save_dir.mkdir(parents=True, exist_ok=True)
 
     llm = build_llm()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
@@ -482,36 +492,11 @@ def build_cache(dataset_iter, out_dir: str, prebuild_index:list[dict]):
     }
     (save_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
-    sample_buffer = []
-    output_buffer = []
-    payload_buffer = []
-    buffer_step = 0
-    for step, (sample, ret_obj) in tqdm(enumerate(zip(dataset_iter, prebuild_index)), total=len(dataset_iter)):
-        assert sample['data_id'] == ret_obj['question_id']
-        qid = sample['data_id']
-        question_text = sample['question']
-        question_image = sample['image_id']
-        #answer = ast.literal_eval(sample['answer'])
-        answer = sample['answer']
-        answer = max(answer, key=len)
-        answer_eos = answer + tokenizer.eos_token
-        answer_ids = tokenizer.encode(answer_eos)
+    dataloader = DataLoader(dataset_iter, batch_size=MACRO_BATCH_SIZE, collate_fn=lambda x: x, num_workers=5, prefetch_factor=3)
+    #t0 = time.perf_counter()
+    for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
+        #assert sample['data_id'] == ret_obj['question_id']
 
-        A = len(answer_ids)
-
-
-        # # NO-EVIDENCE request
-        # prompt_noev = build_chat_prompt_qwen_vl(tokenizer, question_text, num_images=1)
-        # request_noev = {
-        #     "prompt": prompt_noev + answer_prefill_text,
-        #     "multi_modal_data": {"image": [load_image(sample.image_path)]},
-        # }
-
-        # WITH-EVIDENCE requests (batched)
-        evid_paths = ret_obj['ret_images']
-        K = len(evid_paths)
-        evid_ids = ret_obj['ret_images']
-        weights = ret_obj['scores'] or [1.0 / K] * K
 
         # # ---- no-evidence run ----
         # outs_noev = llm.generate(
@@ -523,35 +508,54 @@ def build_cache(dataset_iter, out_dir: str, prebuild_index:list[dict]):
         # noev_ids, noev_lps, noev_tail = extract_prompt_topk_for_answer(outs_noev, A, tokenizer)
 
         # ---- with-evidence runs (batched over evidences) ----
-        evid_paths = MinimumDS(evid_paths)
-        temp_dl = DataLoader(evid_paths, batch_size=30, num_workers=6, collate_fn=lambda batch: batch)
-        for batch in temp_dl:
-            chunk_prompts = []
+        # evid_paths = MinimumDS(evid_paths)
+        # temp_dl = DataLoader(evid_paths, batch_size=30, num_workers=3, collate_fn=lambda batch: batch)
+        sample_buffer = []
+        payload_buffer = []
+        for sample in batch:
+            qid = sample['data_id']
+            question_text = sample['question']
+            question_image = sample['image_id']
+            #answer = ast.literal_eval(sample['answer'])
+            answer = sample['answer']
+            answer = max(answer, key=len)
+            answer_eos = answer + tokenizer.eos_token
+            answer_ids = tokenizer.encode(answer_eos)
 
-            chunk_prompts = process_input(question_text, answer, question_image, batch, tokenizer, uuid_cache, mode='replace')
+            A = len(answer_ids)
+            # # NO-EVIDENCE request
+            # prompt_noev = build_chat_prompt_qwen_vl(tokenizer, question_text, num_images=1)
+            # request_noev = {
+            #     "prompt": prompt_noev + answer_prefill_text,
+            #     "multi_modal_data": {"image": [load_image(sample.image_path)]},
+            # }
 
-        if buffer_step < MACRO_BATCH_SIZE:
-            payload_buffer.append([qid, A])
-            sample_buffer.extend(chunk_prompts)
-            buffer_step += 1
-            continue
+            # WITH-EVIDENCE requests (batched)
+            evid_paths = sample['ret_images_path']
+            K = len(evid_paths)
+            evid_ids = sample['ret_images']
+            weights = sample['scores'] or [1.0 / K] * K
+            payload_buffer.append([qid, A, evid_paths, weights])
+            sample_buffer.extend(process_input(question_text, answer, question_image, evid_ids, tokenizer, uuid_cache, mode='replace'))
 
         max_ans_len = max([e[1] for e in payload_buffer])
         sampling = build_sampling_params(max_new_tokens=max_ans_len+1, topk_prompt=TOPK_LOGPROB)
+
+        #print(f"Load: {time.perf_counter() -t0}")
         outs_chunk = llm.generate(
             prompts=sample_buffer,
             sampling_params=sampling,
             use_tqdm=False,
         )
-        temp =  list(itertools.chain.from_iterable([e.outputs[0].token_ids for e in outs_chunk]))
-        if any(x < 0 for x in temp):
-            raise AttributeError("Generated token id out of bound")
+        # temp =  list(itertools.chain.from_iterable([e.outputs[0].token_ids for e in outs_chunk]))
+        # if any(x < 0 for x in temp):
+        #     raise AttributeError("Generated token id out of bound")
 
         #output_buffer.extend(outs_chunk)
         # Parse requests in the chunk
 
         #for i in range(len(chunk_prompts)):
-        for ii, (qq, aa) in enumerate(payload_buffer):
+        for ii, (qq, aa, retpath,ww) in enumerate(payload_buffer):
             # Build batched inputs (in chunks to fit memory)
             per_ev_top_ids: List[torch.Tensor]  = []
             per_ev_top_lps: List[torch.Tensor]  = []
@@ -567,7 +571,7 @@ def build_cache(dataset_iter, out_dir: str, prebuild_index:list[dict]):
 
             # ---- mixture over evidences (prob-space average) ----
             if USE_UNION_TOPK_FOR_MIX:
-                mix_ids, mix_logp, mix_tail = union_topk_mixture(per_ev_top_ids, per_ev_top_lps, weights=weights)
+                mix_ids, mix_logp, mix_tail = union_topk_mixture(per_ev_top_ids, per_ev_top_lps, weights=ww)
             else:
                 # Fallback: simple average of tails and keep per-evidence results only
                 mix_ids, mix_logp, mix_tail = noev_ids.clone(), torch.full_like(noev_lps, float("-inf")), noev_tail.clone()
@@ -577,7 +581,7 @@ def build_cache(dataset_iter, out_dir: str, prebuild_index:list[dict]):
             payload = {
                 "qid": qq,
                 "answer_len": aa,
-                "retrieved_ids": evid_ids,
+                "retrieved_ids": retpath,
                 # no-evidence
                 # "noev_top_idx":  noev_ids.to(torch.int32),
                 # "noev_top_logp": noev_lps.to(torch.float16),
@@ -604,12 +608,42 @@ def build_cache(dataset_iter, out_dir: str, prebuild_index:list[dict]):
             torch.cuda.empty_cache()
         
         payload_buffer.clear()
-        output_buffer.clear()
         sample_buffer.clear()
-        buffer_step = 0
+
 
     print(f"[vLLM] finished. cache at: {Path(SAVE_DIR).resolve()}")
 
+def worker(
+    dp_size: int,
+    local_dp_rank: int,
+    global_dp_rank: int,
+    tp_size: int,
+    train_ds: Dataset,
+):
+    # Set DP-related env so vLLM can coordinate ranks if needed
+    # os.environ["VLLM_DP_RANK"] = str(global_dp_rank)
+    # os.environ["VLLM_DP_RANK_LOCAL"] = str(local_dp_rank)
+    # os.environ["VLLM_DP_SIZE"] = str(dp_size)
+    #os.environ["VLLM_DP_MASTER_IP"] = dp_master_ip
+    #os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
+
+    # (Optional) make sure each rank binds to one GPU explicitly
+    #os.environ["CUDA_VISIBLE_DEVICES"] = str(global_dp_rank)
+
+    # Shard prompts across DP ranks
+    n = len(train_ds)
+    floor = n // dp_size
+    rem = n % dp_size
+
+    def start(rank: int) -> int:
+        return rank * floor + min(rank, rem)
+
+    shard = train_ds[start(global_dp_rank): start(global_dp_rank + 1)]
+    shard = MinimumDS(shard)
+    build_cache(dataset_iter=shard, out_dir=SAVE_DIR)
+
+# 15000-100000
+# 100000+1300*20
 
 if __name__ == "__main__":
     # TODO: replace with your dataset loader
@@ -629,18 +663,41 @@ if __name__ == "__main__":
     # build_cache(dataset_iter(), SAVE_DIR)
 
     
-    #train_ds = datasets.load_from_disk('/data_external/InfoSeek/train')
-    #test_ds = datasets.load_from_disk('/data_external/InfoSeek/test')
-
-
-
-    with open('/data_external/InfoSeek/infoseek_train.jsonl') as f:
-        train_ds = [json.loads(e) for e in f.readlines()]
-
+    #train_ds = datasets.load_from_disk('/data_external/SKVQA/IRCAP/train')
+    #test_ds = datasets.load_from_disk('/data_external/SKVQA/IRCAP/test')
+    # with open('/data_external/InfoSeek/infoseek_train.jsonl') as f:
+    #     train_ds = [json.loads(e) for e in f.readlines()]
     # train_ds = train_ds.cast_column("image", HFImage(decode=True))
     # test_ds = test_ds.cast_column("image", HFImage(decode=True))
-    with open('/data_external/InfoSeek/query_ret_imgs.jsonl') as f:
-        prebuild_index = [json.loads(e) for e in f.readlines()]
-    train_ds = train_ds[args.start:args.end]
-    prebuild_index = prebuild_index[args.start:args.end]
-    build_cache(dataset_iter=train_ds, out_dir=SAVE_DIR, prebuild_index=prebuild_index)
+    # with open('/data_external/InfoSeek/query_ret_imgs.jsonl') as f:
+    #     prebuild_index = [json.loads(e) for e in f.readlines()]
+    #train_ds = train_ds.select(range(50000,len(prebuild_index)))
+    #prebuild_index = prebuild_index[50000:]
+    train_ds = datasets.load_from_disk('/data_external/InfoSeek/train_datastore')
+    train_ds = train_ds.select(range(args.start, args.end))
+    train_ds = MinimumDS(train_ds)
+    
+    build_cache(dataset_iter=train_ds, out_dir=SAVE_DIR)
+
+    # dp_size = 4      # 4 GPUs
+    # tp_size = 1      # 1 GPU per worker, no TP
+    # #dp_master_ip = "127.0.0.1"
+    # #dp_master_port = get_open_port()
+
+    # procs = []
+    # for local_dp_rank, global_dp_rank in enumerate(range(dp_size)):
+    #     p = Process(
+    #         target=worker,
+    #         args=(
+    #             dp_size,
+    #             local_dp_rank,
+    #             global_dp_rank,
+    #             tp_size,
+    #             train_ds,
+    #         ),
+    #     )
+    #     p.start()
+    #     procs.append(p)
+
+    # for p in procs:
+    #     p.join()
