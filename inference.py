@@ -1,3 +1,4 @@
+from copy import deepcopy
 import torch
 import torch.nn.functional as F
 from transformers import Qwen3VLForConditionalGeneration
@@ -26,6 +27,12 @@ def combine_logits(base_logits, mem_logits, mode="residual", eta_or_lambda=0.5, 
         return torch.log(p_final.clamp_min(1e-12))
     else:
         raise ValueError("mode must be 'residual' or 'mixture'")
+    
+def prob_mix(base_logits, mem_logits, lam=0.6):  # lam = weight on base
+    pb = F.softmax(base_logits, dim=-1)
+    pm = F.softmax(mem_logits, dim=-1)
+    p  = lam * pb + (1.0 - lam) * pm
+    return torch.log(p.clamp_min(1e-32))  # return logits for sampling
 
 def top_k_top_p_filtering(logits, top_k=None, top_p=None):
     """ Inplace filtering of logits for top-k / nucleus sampling. """
@@ -87,27 +94,33 @@ def generate_with_memory(
         output_hidden_states=True,
         return_dict=True
     )
-    past_kv = out.past_key_values
+    kv_snapshot = deepcopy(out.past_key_values)
     last_base_logits = out.logits[:, -1, :]               # [1,V]
     h_last = out.hidden_states[LAYER_IDX][:, -1, :]  # [1,H]
     mem_logits = memory(h_last)              # [1,V]
-    fused_logits = combine_logits(last_base_logits, mem_logits, eta_or_lambda=eta_or_lambda)
+    #fused_logits = combine_logits(last_base_logits, mem_logits, eta_or_lambda=eta_or_lambda)
 
     if eos_token_id is None:
         eos_token_id = tokenizer.eos_token_id
 
     # ---- First token ----
-    next_token = torch.argmax(fused_logits, dim=-1)  # greedy by default; or self._sample_from_logits(fused_logits)
-    generated = [next_token.item()]
-    baselm_gen = [torch.argmax(last_base_logits, -1).item()]
+
+    #next_token_mem = torch.argmax(mem_logits, dim=-1)  # greedy by default; or self._sample_from_logits(fused_logits)
+    next_token_base = torch.argmax(last_base_logits, -1)
+    mixed_prob = prob_mix(last_base_logits, mem_logits, eta_or_lambda)
+    next_token_mixed = torch.argmax(mixed_prob, dim=-1)
+
+    generated = [next_token_mixed.item()]
+    baselm_gen = [next_token_base.item()]
 
     # Update for step decoding
-    step_input_ids = next_token.unsqueeze(0)  # [1,1]
+    step_input_ids = next_token_mixed.unsqueeze(0)  # [1,1]
+    step_input_ids_base = next_token_base.unsqueeze(0)
     step_attn = torch.ones_like(step_input_ids)
 
     # Some MLLMs need images every step; otherwise pass None
     #step_images = None if self.images_first_pass_only else images_first
-
+    past_kv = deepcopy(kv_snapshot)
     # ---- Decode loop ----
     for _ in range(max_new_tokens - 1):
         out = model.forward(
@@ -122,19 +135,51 @@ def generate_with_memory(
         base_logits = out.logits[:, -1, :]                      # [1,V]
         h_last = out.hidden_states[LAYER_IDX][:, -1, :]    # [1,H]
         mem_logits = memory(h_last)                # [1,V]
-        fused_logits = combine_logits(base_logits, mem_logits, eta_or_lambda=eta_or_lambda)      # [1,V]
+        #fused_logits = combine_logits(base_logits, mem_logits, eta_or_lambda=eta_or_lambda)      # [1,V]
 
         # sample or greedy
         # next_token = self._sample_from_logits(fused_logits)
-        next_token = torch.argmax(fused_logits, dim=-1)
+        next_token_base = torch.argmax(base_logits, -1)
+        mixed_prob = prob_mix(base_logits, mem_logits, eta_or_lambda)
+        next_token_mixed = torch.argmax(mixed_prob, dim=-1)
 
-        generated.append(next_token.item())
-        baselm_gen.append(torch.argmax(base_logits, dim=-1).item())
-        if next_token.item() == eos_token_id:
+        generated.append(next_token_mixed.item())
+        #baselm_gen.append(next_token_base.item())
+        if next_token_mixed.item() == eos_token_id:
             break
 
-        step_input_ids = next_token.unsqueeze(0)  # [1,1]
+        step_input_ids = next_token_mixed.unsqueeze(0)  # [1,1]
         step_attn = torch.ones_like(step_input_ids)
+
+    past_kv = deepcopy(kv_snapshot)
+    for _ in range(max_new_tokens - 1):
+        out = model.forward(
+            input_ids=step_input_ids_base,
+            attention_mask=step_attn,
+            use_cache=True,
+            past_key_values=past_kv,
+            output_hidden_states=True,
+            return_dict=True
+        )
+        past_kv = out.past_key_values
+        base_logits = out.logits[:, -1, :]                      # [1,V]
+        #h_last = out.hidden_states[LAYER_IDX][:, -1, :]    # [1,H]
+        #mem_logits = memory(h_last)                # [1,V]
+        #fused_logits = combine_logits(base_logits, mem_logits, eta_or_lambda=eta_or_lambda)      # [1,V]
+
+        # sample or greedy
+        # next_token = self._sample_from_logits(fused_logits)
+        next_token_base = torch.argmax(base_logits, -1)
+        #mixed_prob = prob_mix(base_logits, mem_logits, eta_or_lambda)
+        #next_token_mixed = torch.argmax(mixed_prob, dim=-1)
+
+        #generated.append(next_token_mixed.item())
+        baselm_gen.append(next_token_base.item())
+        if next_token_base.item() == eos_token_id:
+            break
+
+        step_input_ids_base = next_token_base.unsqueeze(0)  # [1,1]
+        step_attn = torch.ones_like(step_input_ids_base)
 
 
     #gen_ids = torch.stack(generated, dim=1) if generated else torch.empty(1, 0, dtype=torch.long, device=device)

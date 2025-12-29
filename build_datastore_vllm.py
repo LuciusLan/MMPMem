@@ -9,7 +9,7 @@ from multiprocessing import Process
 #os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ['CUDA_VISIBLE_DEVICES']=args.device
 os.environ["HF_HOME"]='/data_external/hf_cache'
-os.environ['VLLM_FLASH_ATTN_VERSION']="2"
+os.environ['VLLM_FLASH_ATTN_VERSION']="3"
 os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
 # os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from pathlib import Path
@@ -43,7 +43,7 @@ TEMPERATURE             = 1.0
 TOPK_LOGPROB            = 32           # store top-K per position
 STORE_PER_EVIDENCE      = False        # set True to also store per-evidence top-K (large!)
 EVIDENCE_BATCH_SIZE     = 30           # vLLM batch over evidences per query (set to <= K)
-MACRO_BATCH_SIZE        = 20
+MACRO_BATCH_SIZE        = 40
 SAVE_DIR                = '/data_external/InfoSeek/DataStore_rep/'
 USE_UNION_TOPK_FOR_MIX  = True         # union-of-topK across evidences to compute mixture
 DEVICE                  = "cuda" if torch.cuda.is_available() else "cpu"
@@ -273,13 +273,17 @@ def build_llm():
         model=MODEL_NAME,
         dtype=DTYPE,
         tensor_parallel_size=1,
-        max_num_batched_tokens=55000,
+        max_num_batched_tokens=90000,
         #max_num_seqs=150,
         max_model_len=MAX_MODEL_LEN,
         max_logprobs=32,
         gpu_memory_utilization=GPU_MEM_UTIL,
         trust_remote_code=True,
-        limit_mm_per_prompt={"image": 2, "video": 0},
+        limit_mm_per_prompt={"image": 1, "video": 0},
+        mm_processor_kwargs={
+            "min_pixels": 64 * 32 * 32,
+            "max_pixels": 1280 * 32 * 32,
+        }
     )
     return llm
 
@@ -492,7 +496,7 @@ def build_cache(dataset_iter, out_dir: str, prebuild_index:list[dict]=None):
     }
     (save_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
-    dataloader = DataLoader(dataset_iter, batch_size=MACRO_BATCH_SIZE, collate_fn=lambda x: x, num_workers=5, prefetch_factor=3)
+    dataloader = DataLoader(dataset_iter, batch_size=MACRO_BATCH_SIZE, collate_fn=lambda x: x, num_workers=3, prefetch_factor=1)
     #t0 = time.perf_counter()
     for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
         #assert sample['data_id'] == ret_obj['question_id']
@@ -535,7 +539,7 @@ def build_cache(dataset_iter, out_dir: str, prebuild_index:list[dict]=None):
             K = len(evid_paths)
             evid_ids = sample['ret_images']
             weights = sample['scores'] or [1.0 / K] * K
-            payload_buffer.append([qid, A, evid_paths, weights])
+            payload_buffer.append([qid, A+1, evid_paths, weights])
             sample_buffer.extend(process_input(question_text, answer, question_image, evid_ids, tokenizer, uuid_cache, mode='replace'))
 
         max_ans_len = max([e[1] for e in payload_buffer])

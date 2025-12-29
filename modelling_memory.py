@@ -7,13 +7,13 @@ class SwiGLU(nn.Module):
     def __init__(self, d_in, d_up):
         super().__init__()
         # in -> 2*up for gate/value, up -> in
-        self.w_in = nn.Linear(d_in, 2 * d_up, bias=True)
-        self.w_out = nn.Linear(d_up, d_in, bias=True)
+        self.w_in = nn.Linear(d_in, 2 * d_up, bias=False)
+        self.w_out = nn.Linear(d_up, d_in, bias=False)
 
-        nn.init.kaiming_uniform_(self.w_in.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.w_in.bias)
-        nn.init.kaiming_uniform_(self.w_out.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.w_out.bias)
+        nn.init.kaiming_uniform_(self.w_in.weight, nonlinearity="relu")
+        #nn.init.zeros_(self.w_in.bias)
+        nn.init.xavier_uniform_(self.w_out.weight)
+        #nn.init.zeros_(self.w_out.bias)
 
     def forward(self, x):
         x = self.w_in(x)                     # [B, 2u]
@@ -47,13 +47,14 @@ class MemoryMLP(nn.Module):
     # TODO:
     # Bind LM head with base LM head
 
-    def __init__(self, d_in=4096, d_up=10240, num_blocks=5, vocab_size=151936,
+    def __init__(self, d_in=4096, d_up=8192, num_blocks=6, vocab_size=151936,
                  head='dense', head_rank=4096, norm='rms'):
         super().__init__()
         self.blocks = nn.ModuleList([MemBlock(d_in, d_up, norm=norm) for _ in range(num_blocks)])
+        self.out_norm = RMSNorm(head_rank)
         if head == 'dense':
-            self.head = nn.Linear(d_in, vocab_size, bias=True)
-            nn.init.zeros_(self.head.bias)
+            self.head = nn.Linear(d_in, vocab_size, bias=False)
+            #nn.init.zeros_(self.head.bias)
             nn.init.zeros_(self.head.weight)
         elif head == 'factorized':
             self.proj = nn.Linear(d_in, head_rank, bias=False)
@@ -68,6 +69,7 @@ class MemoryMLP(nn.Module):
         # h: [B, d_in] (e.g., last-token hidden at chosen layer)
         for blk in self.blocks:
             h = blk(h)
+        h = self.out_norm(h)
         if self.head_type == 'dense':
             return self.head(h)              # residual logits
         else:
