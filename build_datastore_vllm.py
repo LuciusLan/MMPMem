@@ -1,26 +1,30 @@
 import os, json, math, argparse
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--start', type=int)
-parser.add_argument('--end',type=int)
-parser.add_argument('--device', type=str)
-args = parser.parse_args()
-from multiprocessing import Process
+# parser = argparse.ArgumentParser()
+# parser.add_argument('--start', type=int)
+# parser.add_argument('--end',type=int)
+# parser.add_argument('--device', type=str)
+# args = parser.parse_args()
 #os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ['CUDA_VISIBLE_DEVICES']=args.device
+os.environ["OMP_NUM_THREADS"] = "16"
 os.environ["HF_HOME"]='/data_external/hf_cache'
+os.environ['CUDA_VISIBLE_DEVICES']="0" #args.device
 os.environ['VLLM_FLASH_ATTN_VERSION']="3"
 os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"]="spawn"
 # os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple, Union, Literal
+from typing import List, Dict, Any, Optional, Tuple, Union, Literal, Sequence
 from dataclasses import dataclass
+from collections import defaultdict
 import ast
 from collections import OrderedDict
 import uuid, hashlib
 import itertools
 import time
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoConfig
@@ -34,7 +38,7 @@ from tqdm import tqdm
 # =========================
 # Config
 # =========================
-MODEL_NAME              = 'Qwen/Qwen3-VL-8B-Instruct'
+MODEL_NAME              = '/wyy/models/Qwen3-VL-8B-Instruct'
 TP_SIZE                 = int(os.environ.get("TP_SIZE", "2"))        # tensor parallel degree
 DTYPE                   = os.environ.get("DTYPE", "bfloat16")         # "float16" or "bfloat16"
 MAX_MODEL_LEN           = int(os.environ.get("MAX_MODEL_LEN", "16384"))
@@ -43,7 +47,7 @@ TEMPERATURE             = 1.0
 TOPK_LOGPROB            = 32           # store top-K per position
 STORE_PER_EVIDENCE      = False        # set True to also store per-evidence top-K (large!)
 EVIDENCE_BATCH_SIZE     = 30           # vLLM batch over evidences per query (set to <= K)
-MACRO_BATCH_SIZE        = 40
+MACRO_BATCH_SIZE        = 10
 SAVE_DIR                = '/data_external/InfoSeek/DataStore_rep/'
 USE_UNION_TOPK_FOR_MIX  = True         # union-of-topK across evidences to compute mixture
 DEVICE                  = "cuda" if torch.cuda.is_available() else "cpu"
@@ -168,7 +172,7 @@ def build_two_image_requests(prompt: str, image1_path: Union[str, Image.Image], 
     return requests
 
 
-def process_input(question, answer, image, ret_images, tokenizer=None, uuid_cache:ImageUUIDLRU=None, mode:Literal['augment', 'replace']='augment')->list[TextPrompt]:
+def process_input(question, answer, image, ret_images, tokenizer=None, uuid_cache:ImageUUIDLRU=None, mode:Literal['augment', 'replace', 'replace_noans', 'augment_noans']='replace_noans')->list[TextPrompt]:
 
     if mode == 'augment':
         prompt_teacher = "Answer the image related question. For many fact checking questions, the desired answer would be named entities instead of common concept, for example \"Mount Everest\" instead of \"mountain top\", \"River Thames\" instead of \"river\". Be concise, output the answer only, without any additional words. An additional image is provided for your reference, but it is not guaranteed to be relevant to original question."
@@ -216,6 +220,20 @@ def process_input(question, answer, image, ret_images, tokenizer=None, uuid_cach
                 }]
             }
         ]
+    elif mode == 'replace_noans':
+        prompt_teacher = "Answer the image related question. For many fact checking questions, the desired answer would be named entities instead of common concept, for example \"Mount Everest\" instead of \"mountain top\", \"River Thames\" instead of \"river\". Be concise, output the answer only, without any additional words."
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "image": ret_images[0],
+                    },
+                    {"type": "text", "text": prompt_teacher + "\nQuestion: " +question},
+                ]
+            },
+        ]
     # Preparation for inference
 
     # image_inputs, video_inputs = process_vision_info(messages)
@@ -228,11 +246,11 @@ def process_input(question, answer, image, ret_images, tokenizer=None, uuid_cach
     # )
     # inputs = inputs.to("cuda")
     
-    prompt = tokenizer.apply_chat_template(messages,tokenize=False,)
+    prompt = tokenizer.apply_chat_template(messages,tokenize=False,add_generation_prompt=True)
 
     requests = []
     
-    if mode == 'augment':
+    if mode == 'augment' or mode == 'augment_noans':
         img1_uuid = uuid_cache.get_or_create(image)
 
         for ret_image in ret_images:
@@ -247,7 +265,7 @@ def process_input(question, answer, image, ret_images, tokenizer=None, uuid_cach
                 "multi_modal_uuids": {"image": [img1_uuid, None]},
             }
             requests.append(req)
-    elif mode == 'replace':
+    elif mode == 'replace' or mode == 'replace_noans':
         for ret_image in ret_images:
             #img2 = Image.open(img2_path).convert("RGB")
             # If img2 will repeat across batches, give it a stable UUID as well.
@@ -463,6 +481,171 @@ def union_topk_mixture(
     mix_tail = torch.stack(mix_tail_list, dim=0)     # [A]
     return mix_ids, mix_logp, mix_tail
 
+@dataclass
+class Candidate:
+    text: str
+    token_ids: List[int]
+    # Teacher confidence proxy
+    cum_logprob: float
+    len_norm_logprob: float
+    # Retrieval provenance
+    qid: int
+    ridx: int              # retrieval slot within the query (0..K-1)
+    ret_score: float
+    # Final normalized weight for MML
+    weight: float
+
+
+def _softmax_np(x: np.ndarray, tau: float = 1.0) -> np.ndarray:
+    x = x.astype(np.float64) / max(tau, 1e-8)
+    x = x - np.max(x)
+    ex = np.exp(x)
+    return ex / np.sum(ex)
+
+def merge_candidates(cands: List, *, merge_by: str = "token_ids") -> List:
+    """
+    merge_by:
+      - "token_ids": strict, safest
+      - "canon": type-aware canonicalization of decoded text (numbers/years; extend to dates/entities)
+    """
+    buckets: Dict[Tuple, List] = defaultdict(list)
+
+    for c in cands:
+        if merge_by == "token_ids":
+            key = ("tok", tuple(c.token_ids))
+        elif merge_by == "canon":
+            key = canonical_key(c.text)
+        else:
+            raise ValueError(f"Unknown merge_by={merge_by}")
+        buckets[key].append(c)
+
+    merged = []
+    for key, group in buckets.items():
+        # pick a representative (e.g., highest weight)
+        rep = max(group, key=lambda x: x.weight)
+        rep.weight = sum(x.weight for x in group)
+        merged.append(rep)
+
+    # renormalize
+    z = sum(c.weight for c in merged)
+    for c in merged:
+        c.weight /= max(z, 1e-12)
+
+    # sort descending
+    merged.sort(key=lambda x: x.weight, reverse=True)
+    return merged
+
+@torch.no_grad()
+def sample_teacher_candidates_for_mml(
+    llm: LLM,
+    prompts: Sequence[Any],              # vLLM accepts str or dict prompts (incl. multimodal)
+    batch_idx: Sequence[int],            # length N = B*K
+    batch_ret_scores: torch.Tensor,      # [B, K], float
+    sampling_param_mml:SamplingParams,
+    *,
+    n: int = 4,                          # candidates per amortized prompt
+    # Weighting hyperparams
+    tau_s: float = 0.05,                 # retrieval softmax temperature
+    tau_t: float = 1.0,                  # teacher confidence temperature
+    len_penalty_rho: float = 1.0,        # length normalization exponent
+    keep_top_m_per_query: int = 240,      # after pooling across K prompts, keep top-M candidates
+) -> List[List[Candidate]]:
+    """
+    Returns: candidates_per_query[qid] = list of Candidate, with weights normalized per query.
+    """
+
+    assert batch_ret_scores.ndim == 2, "batch_ret_scores must be [B, K]"
+    B, K = batch_ret_scores.shape
+    N = len(prompts)
+    assert len(batch_idx) == N, "batch_idx must have same length as prompts"
+    assert N == B * K, "Expected prompts length to equal B*K (per your batching scheme)"
+
+    # One batched call. Each RequestOutput has .outputs (length n) with cumulative_logprob.
+    request_outputs = llm.generate(list(prompts), sampling_param_mml)
+
+    # Determine retrieval slot within each query (ridx).
+    # This assumes that, for each qid, the K prompts appear in a consistent order (0..K-1).
+    per_q_seen = defaultdict(int)
+
+    pooled: List[List[Candidate]] = [[] for _ in range(B)]
+
+    for p, req_out in enumerate(request_outputs):
+        qid = int(batch_idx[p])
+        assert 0 <= qid < B
+
+        ridx = per_q_seen[qid]
+        per_q_seen[qid] += 1
+        assert ridx < K, (
+            "More than K prompts encountered for a query. "
+            "If your prompts are not grouped per query, pass an explicit ridx array."
+        )
+
+        ret_score = float(batch_ret_scores[qid, ridx].item())
+
+        for out in req_out.outputs:
+            text = out.text
+            token_ids = list(out.token_ids)
+            cum_lp = float(out.cumulative_logprob or 0.0)
+            # length-normalized teacher confidence (avoid division by 0)
+            L = max(len(token_ids), 1)
+            len_norm_lp = cum_lp / (L ** max(len_penalty_rho, 0.0))
+
+            pooled[qid].append(
+                Candidate(
+                    text=text,
+                    token_ids=token_ids,
+                    cum_logprob=cum_lp,
+                    len_norm_logprob=len_norm_lp,
+                    qid=qid,
+                    ridx=ridx,
+                    ret_score=ret_score,
+                    weight=0.0,  # filled later
+                )
+            )
+
+    # Compute weights per query:
+    # w_m ∝ softmax(ret_score/tau_s) * exp(len_norm_logprob/tau_t)
+    candidates_per_query: List[List[Candidate]] = [[] for _ in range(B)]
+    for qid in range(B):
+        cands = pooled[qid]
+        if not cands:
+            continue
+
+        # Retrieval weights: compute softmax over K slots, then assign to each candidate by ridx
+        rs = batch_ret_scores[qid].detach().cpu().numpy()  # [K]
+        w_ret = _softmax_np(rs, tau=tau_s)                 # [K]
+
+        # Teacher confidence weights (unnormalized)
+        conf = np.array([c.len_norm_logprob for c in cands], dtype=np.float64) / max(tau_t, 1e-8)
+        conf = conf - np.max(conf)
+        w_conf = np.exp(conf)
+
+        w = np.array([w_ret[c.ridx] for c in cands], dtype=np.float64) * w_conf
+        # Normalize within query
+        w_sum = float(np.sum(w))
+        if w_sum <= 0:
+            w = np.ones_like(w) / len(w)
+        else:
+            w = w / w_sum
+
+        # Attach weights and keep top-M (optional)
+        idx_sorted = np.argsort(-w)[:keep_top_m_per_query]
+        out_cands = []
+        for j in idx_sorted.tolist():
+            c = cands[j]
+            c.weight = float(w[j])
+            out_cands.append(c)
+
+        # Renormalize after truncation
+        z = sum(c.weight for c in out_cands)
+        for c in out_cands:
+            c.weight /= max(z, 1e-12)
+
+        candidates_per_query[qid] = out_cands
+
+    merged_candidates = [merge_candidates(e, merge_by='token_ids') for e in candidates_per_query]
+    return candidates_per_query
+
 def collate_image(image_paths):
     return [load_image(image) for image in image_paths]
 
@@ -516,7 +699,10 @@ def build_cache(dataset_iter, out_dir: str, prebuild_index:list[dict]=None):
         # temp_dl = DataLoader(evid_paths, batch_size=30, num_workers=3, collate_fn=lambda batch: batch)
         sample_buffer = []
         payload_buffer = []
-        for sample in batch:
+        batch_idx = []
+        batch_internal_id = []
+        batch_ret_scores = []
+        for bid, sample in enumerate(batch):
             qid = sample['data_id']
             question_text = sample['question']
             question_image = sample['image_id']
@@ -538,13 +724,37 @@ def build_cache(dataset_iter, out_dir: str, prebuild_index:list[dict]=None):
             evid_paths = sample['ret_images_path']
             K = len(evid_paths)
             evid_ids = sample['ret_images']
-            weights = sample['scores'] or [1.0 / K] * K
+            weights = sample['scores'][1:] or [1.0 / K] * K
+
+            for ret_i in evid_paths:
+                batch_idx.append(f"{qid}-{ret_i}")
+            batch_internal_id.extend([bid]*K)
+            batch_ret_scores.append(weights)
             payload_buffer.append([qid, A+1, evid_paths, weights])
-            sample_buffer.extend(process_input(question_text, answer, question_image, evid_ids, tokenizer, uuid_cache, mode='replace'))
+            sample_buffer.extend(process_input(question_text, answer, question_image, evid_ids, tokenizer, uuid_cache, mode='replace_noans'))
+        
+        batch_ret_scores = torch.tensor(batch_ret_scores, dtype=torch.float)
 
         max_ans_len = max([e[1] for e in payload_buffer])
         sampling = build_sampling_params(max_new_tokens=max_ans_len+1, topk_prompt=TOPK_LOGPROB)
 
+        sampling_param_mml = SamplingParams(
+            max_tokens=30,           # generate A tokens (we won't use them; we need prompt_logprobs)
+            temperature=0.7,                     # deterministic
+            top_p=0.8,
+            top_k=20,
+            logprobs=TOPK_LOGPROB,
+            #prompt_logprobs=None,
+            detokenize=True,
+            allowed_token_ids=list(range(VOCAB_SIZE)),
+            presence_penalty=1.5,
+            n=8,
+            #seed=4008
+            #repetition_penalty=1.0,
+            #presence_penalty=1.5
+        )
+
+        sample_teacher_candidates_for_mml(llm,sample_buffer, batch_internal_id, batch_ret_scores,sampling_param_mml)
         #print(f"Load: {time.perf_counter() -t0}")
         outs_chunk = llm.generate(
             prompts=sample_buffer,
@@ -678,7 +888,7 @@ if __name__ == "__main__":
     #train_ds = train_ds.select(range(50000,len(prebuild_index)))
     #prebuild_index = prebuild_index[50000:]
     train_ds = datasets.load_from_disk('/data_external/InfoSeek/train_datastore')
-    train_ds = train_ds.select(range(args.start, args.end))
+    #train_ds = train_ds.select(range(args.start, args.end))
     train_ds = MinimumDS(train_ds)
     
     build_cache(dataset_iter=train_ds, out_dir=SAVE_DIR)

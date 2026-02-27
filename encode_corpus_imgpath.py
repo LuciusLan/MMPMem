@@ -7,9 +7,9 @@ def parse_args():
     p.add_argument("--data_root", type=str, required=True)
     p.add_argument("--out_dir", type=str, required=True)
     p.add_argument("--model_name", type=str, default="/wy_data/bge_vl_large")
-    p.add_argument("--batch_size", type=int, default=256)
+    p.add_argument("--batch_size", type=int, default=400)
     p.add_argument("--device", type=str, default="0")
-    p.add_argument("--shard_size", type=int, default=10_000)
+    p.add_argument("--shard_size", type=int, default=100_000)
     p.add_argument("--num_workers", type=int, default=max(1, (os.cpu_count() or 16) // 4))
     p.add_argument("--bf16", action="store_true", help="Enable BF16 autocast on CUDA.")
     return p.parse_args()
@@ -29,7 +29,7 @@ import csv
 import pandas as pd
 from PIL import Image, UnidentifiedImageError
 
-import faiss
+#import faiss
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 import torch.nn.functional as F
@@ -52,6 +52,14 @@ def collect_image_paths(root_dir: str | Path, extra_exts: Optional[List[str]] = 
         raise RuntimeError(f"No images found under: {root}")
     return sorted(paths, key=lambda p: str(p))
 
+def collect_image_paths_multi(
+    root_dirs: Iterable[str | Path],
+    extra_exts: Optional[List[str]] = None
+) -> List[Path]:
+    paths = []
+    for rd in root_dirs:
+        paths.extend(collect_image_paths(rd, extra_exts=extra_exts))
+    return sorted(set(paths), key=lambda p: str(p))
 
 def get_world_info_from_env():
     """Resolve rank, world_size, and local_rank from torchrun environment variables."""
@@ -81,16 +89,21 @@ class ImagePathDataset(Dataset):
             return None, str(path), idx
 
 
-def make_collate(processor: CLIPProcessor):
+def make_collate(processor: CLIPProcessor=None):
     def collate(samples: List[Tuple[Image.Image | None, str, int]]):
         # Filter failed loads while preserving alignment
-        samples = [(img, p, i) for img, p, i in samples if img is not None]
-        if not samples:
-            return {"pixel_values": None, "paths": [], "gidx": []}
-        images, paths, gidx = zip(*samples)
-        encoded = processor(images=list(images), return_tensors="pt")
+        # samples = [(img, p, i) for img, p, i in samples if img is not None]
+        # if not samples:
+        #     return {"pixel_values": None, "paths": [], "gidx": []}
+        # images, paths, gidx = zip(*samples)
+        # encoded = processor(images=list(images), return_tensors="pt")
 
-        encoded.update({"paths": list(paths), "gidx": list(gidx)})
+        # encoded.update({"paths": list(paths), "gidx": list(gidx)})
+        batch = {}
+        batch['paths'] = [e[1] for e in samples]
+        batch['gidx'] = [e[2] for e in samples]
+        batch['images']= [{"image": e[0]} for e in samples]
+        return batch
         return encoded
     return collate
 
@@ -164,7 +177,8 @@ def run(args):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) Deterministic corpus and rank-local slice (no padding, no duplication)
-    paths = collect_image_paths(args.data_root)
+    root_dirs = [args.data_root+ "/01",args.data_root+ "/02",args.data_root+ "/03",args.data_root+ "/04",args.data_root+ "/06",args.data_root+ "/07",args.data_root+ "/08",args.data_root+ "/09"]
+    paths = collect_image_paths_multi(root_dirs)
     ds_full = ImagePathDataset(paths)
 
     n = len(ds_full)
@@ -189,14 +203,17 @@ def run(args):
     # model.set_processor("/wy_data/bge_vl_large")
     # model.eval()
 
-    model_id = "/wy_data/siglip"   # try FixRes too: e.g., ...-patch16-384
+    #model_id = "/data_external/bge_vl_large"   # try FixRes too: e.g., ...-patch16-384
 
-    model = AutoModel.from_pretrained(model_id, torch_dtype=torch.bfloat16 if device=="cuda" else None).to(device).eval()
-    proc  = AutoProcessor.from_pretrained(model_id)
+    # model = AutoModel.from_pretrained(model_id, torch_dtype=torch.bfloat16 if device=="cuda" else None).to(device).eval()
+    # proc  = AutoProcessor.from_pretrained(model_id)
+
+    from qwen3_vl_embedding import Qwen3VLEmbedder
+    model = Qwen3VLEmbedder(model_name_or_path="/data_external/Qwen3-VL-Embedding-2B", attn_implementation="flash_attention_2", dtype=torch.bfloat16)
 
     # 3) DataLoader
     #collate = make_collate(model.processor)
-    collate = make_collate(proc)
+    collate = make_collate(None)
     dl = DataLoader(
         ds,
         batch_size=args.batch_size,
@@ -212,7 +229,7 @@ def run(args):
     autocast_ctx = (
         torch.autocast(device_type="cuda", dtype=dtype)
         if (dtype is not None)
-        else torch.cuda.amp.autocast(enabled=False)
+        else torch.amp.autocast(enabled=False)
     )
 
     shard_id = 0
@@ -224,14 +241,17 @@ def run(args):
 
     with torch.no_grad(), autocast_ctx:
         for batch in tqdm(dl, total=len(dl), desc=f"[rank {rank}] Embedding"):
-            px = batch["pixel_values"]
+            #px = batch["pixel_values"]
+            images = batch['images']
             bpaths = batch.pop("paths")
             gidx = batch.pop("gidx")
-            if px is None or len(bpaths) == 0:
+            if images is None or len(bpaths) == 0:
                 continue
 
-            batch = {k: v.to(model.device) for k,v in batch.items()}
-            feats = model.get_image_features(**batch)  # [B, D]
+            #batch = {k: v.to(model.device) for k,v in batch.items()}
+            #feats = model.get_image_features(**batch)  # [B, D]
+            feats = model.process(images)
+
             feats = F.normalize(feats, p=2, dim=-1)
             feats_np = feats.detach().cpu().half().numpy()
 

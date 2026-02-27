@@ -2,7 +2,7 @@ import os, json, math, argparse
 
 
 #os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ['CUDA_VISIBLE_DEVICES']="1"
+os.environ['CUDA_VISIBLE_DEVICES']="2"
 os.environ["HF_HOME"]='/data_external/hf_cache'
 #os.environ['VLLM_FLASH_ATTN_VERSION']="2"
 os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
@@ -41,7 +41,7 @@ processor= Qwen3VLProcessor.from_pretrained('/wyy/models/Qwen3-VL-8B-Instruct')
 model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16, device_map='cpu')
 model = model.to('cuda')
 memory = MemoryMLP()
-saved_dict = torch.load('/data_external/MMPMem/checkpoints/14.pt')
+saved_dict = torch.load('/data_external/MMPMem/checkpoints/11.pt')
 memory.load_state_dict(saved_dict, strict=True)
 memory = memory.to('cuda')
 
@@ -60,8 +60,8 @@ def process_prompt(inputs):
                         "type": "image",
                         "image": inputs['image'],
                     },
-                    {"type": "text", "text": "Please answer the image related multiple choice question. Be concise, output the answer only, without any additional words.\n" + "\nQuestion: " +question},
-                    #{"type": "text", "text": "Please answer the image related multiple choice question.\nOutput the final answer, the option letter only, wrapped with \"\\boxed{}\"." + "\nQuestion: " +question},
+                    #{"type": "text", "text": "Please answer the image related multiple choice question. Be concise, output the answer only, without any additional words.\n" + "\nQuestion: " +question},
+                    {"type": "text", "text": "Please answer the image related multiple choice question.\nPlease output your selection WITHOUT the option letter. (e.g. If you select answer \"A: panda\", output only \"panda\")\n" + "\nQuestion: " +question},
                 ],
             }
         ]
@@ -93,16 +93,16 @@ for step,row in enumerate(test_ds):
     inputs = process_prompt(row)
     inputs = inputs.to('cuda')
     with torch.inference_mode():
-        gid, text, _ = generate_with_memory(model, memory, processor.tokenizer, inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=0.6)
-        gid, _, text_base = generate_with_memory(model, memory, processor.tokenizer, inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=1.)
+        gid, text, text_base = generate_with_memory(model, memory, processor.tokenizer, inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=0.6)
+        #gid, _, text_base = generate_with_memory(model, memory, processor.tokenizer, inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=1.)
     
 
-    try:
-        pred = re.search(r'\\boxed\{(.+)\}', text.lower(), re.DOTALL)
-        pred = pred.groups()[0]
-    except:
-        pred = ""
-    if row['answer_choice'].lower() in pred.lower() or row['answer'].lower() in text.lower():
+    # try:
+    #     pred = re.search(r'\\boxed\{(.+)\}', text.lower(), re.DOTALL)
+    #     pred = pred.groups()[0]
+    # except:
+    #     pred = ""
+    if row['answer_choice'].lower() in text.lower() or row['answer'].lower() in text.lower():
         cm +=1
         mm_corect = True
     else:
@@ -112,7 +112,7 @@ for step,row in enumerate(test_ds):
         pred_base = re.search(r'\\boxed\{(.+)\}', text_base.lower(), re.DOTALL)
         pred_base = pred_base.groups()[0]
     except:
-        pred_base = ""
+        pred_base = text_base
     if row['answer_choice'].lower() in pred_base.lower() or row['answer'].lower() in text_base.lower():
         cb +=1
         base_correct = True
