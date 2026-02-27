@@ -3,13 +3,14 @@ import os
 os.environ['HF_HOME'] = '/data_external/hf_cache'
 os.environ['CUDA_VISIBLE_DEVICES']="0,1"
 os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
-from typing import List, Tuple, Iterable
+from typing import List, Dict, Optional, Tuple, Literal, Callable, Any, Iterable
 from transformers.feature_extraction_utils import BatchFeature
 from glob import glob
 import ast
 import json
 import math
 import random
+from dataclasses import dataclass
 
 import numpy as np
 #import pandas as pd
@@ -21,32 +22,36 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModel, Qwen3VLForConditionalGeneration, CLIPModel, CLIPProcessor, AutoProcessor, Qwen3VLProcessor
 import datasets
 import wandb
 #from qwen_vl_utils import process_vision_info
-from modelling_memory import MemoryMLP
-from inference import generate_with_memory
-from eval_util import score_infoseek
-
 from accelerate import dispatch_model, infer_auto_device_map, Accelerator
 from accelerate.utils import tqdm
 #from tqdm import tqdm
 
+from modelling_memory import MemoryMLP, WrappedLM
+from inference import generate_with_memory
+from eval_util import score_infoseek
+from seq_kd_utils import compute_seqkd_or_mml_loss
+
 # ---------------------------
 # Hyperparameters & utilities
 # ---------------------------
-TEMPERATURE = 1.0         # softmax temperature for teacher
+TEMPERATURE = 1.5         # softmax temperature for teacher
 ALPHA_CE = 1.0            # weight for gold CE
 BETA_DELTA = 0.5          # weight for delta residual distillation (optional)
-KL_WEIGHT = 1.0           # weight for teacher KL
+KL_WEIGHT = 0.3           # weight for teacher KL
 USE_RESIDUAL = False       # if True: memory learns residual logits; else memory outputs a dist directly
-HID_LAYER_ID = 29
+HID_LAYER_ID = 32
 EPS = 1e-12
-MACRO_BATCH_SIZE = 32
+MACRO_BATCH_SIZE = 16
+LR = 1e-4
 
-
-
+# =========================
+# Optional: example train step wrapper
+# =========================
 
 def softmax_T(logits, T=1.0):
     return F.softmax(logits / T, dim=-1)
@@ -100,47 +105,19 @@ def sparse_kl_with_tail(
     kl = term_topk + term_tail    # [B, A]
     return kl.mean()              # scalar
 
-
-def concat_tf_inputs(sample, answer_ids) -> tuple[BatchFeature, int]:
-    """
-    prompt_ids: [B, P]
-    answer_ids: [B, A]
-    Returns:
-      tf_ids: [B, P + A - 1]  (prompt + answer[:-1])
-      tgt:    [B, A]          (full answer as labels)
-    """
-    # teacher-forcing: input = prompt + answer[:-1], targets = answer[:]
-    sample['pixel_values'] = sample['pixel_values'].to(torch.bfloat16)
-
-
-    tf_inp = torch.cat([sample['input_ids'], answer_ids[:, :-1]], dim=1)
-    tgt    = answer_ids                                       # keep batch dimension
-    return tf_inp, tgt
-
-def memory_forward(memory, h):
-    """
-    By convention here:
-    - If USE_RESIDUAL: memory outputs residual logits (same vocab size) to be *added* to base.
-    - Else: memory outputs direct logits for a distribution to be mixed in prob-space.
-    """
-    mem_out = memory(h)  # adapt to your memory API (e.g., memory(h))
-    # Expect mem_out.logits: [1, vocab]
-    return mem_out
-
 # ---------------------------
 # Single-sample training step
 # ---------------------------
-def train_step(model:Qwen3VLForConditionalGeneration, memory:nn.Module, optimizer,scheduler, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, teacher_ids:torch.Tensor, teacher_logprob:torch.Tensor, tail_logprob:torch.Tensor):
-    memory.train()
+def train_step(model:WrappedLM, model_config, accelerator:Accelerator, processor, optimizer,scheduler, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, teacher_ids:torch.Tensor, teacher_logprob:torch.Tensor, tail_logprob:torch.Tensor, ret_scores:torch.Tensor):
     optimizer.zero_grad(set_to_none=True)
-
     base_inputs = {k :v.to(device) for k,v in base_inputs.items()}
     input_lengths= input_lengths.to(device)
     answer_ids = answer_ids.to(device)
     answer_mask = answer_mask.to(device)
-    teacher_ids = teacher_ids.to(device)
-    teacher_logprob = teacher_logprob.to(device)
-    tail_logprob = tail_logprob.to(device)
+    teacher_ids = [e.to(device) for e in teacher_ids]
+    teacher_logprob = [e.to(device) for e in teacher_logprob]
+    #tail_logprob = tail_logprob.to(device)
+    ret_scores = [e.to(device) for e in ret_scores]
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         # 1) Get base state & logits (frozen)
@@ -148,119 +125,89 @@ def train_step(model:Qwen3VLForConditionalGeneration, memory:nn.Module, optimize
         _, La_max = answer_ids.shape
 
         # ----- base model forward, frozen -----
-        out = model.forward(
+        out = model(
             **base_inputs,
-            output_hidden_states=True,
+            mix_mode='mem'
         )
         #logits = out["logits"].detach()             # [B, L_full_max, V]
-        hidden = out["hidden_states"][HID_LAYER_ID].detach()  # [B, L_full_max, H] (or choose another layer)
+        # hidden = out["hidden_states"][HID_LAYER_ID].detach()  # [B, L_full_max, H] (or choose another layer)
 
-        B, L_full_max, V = out["logits"].shape
-        H = hidden.size(-1)
+        # B, L_full_max, V = out["logits"].shape
+        # H = hidden.size(-1)
 
-
-        # ----- gather per-answer-step logits and hidden states -----
-        # Answer token j (0-based) for sample i is predicted at time t_ij = start_i - 1 + j,
-        # where start_i = |question_i| = input_lengths[i].
-        j_pos = torch.arange(La_max, device=device).unsqueeze(0).expand(B, -1)          # [B, La_max]
-        t_indices = (input_lengths.unsqueeze(1) - 1 + j_pos).clamp(0, L_full_max - 1)  # [B, La_max]
-
-        #bo = out["logits"].argmax(-1)
-        #image_end = first_subsequence_pos(base_inputs['input_ids'], IMAGE_END_TOKENS)
-
-        #idx_logits = t_indices.unsqueeze(-1).expand(-1, -1, V)   # [B, La_max, V]
-        idx_hidden = t_indices.unsqueeze(-1).expand(-1, -1, H)   # [B, La_max, H]
-
-        #base_ans_logits = logits.gather(1, idx_logits)           # [B, La_max, V]
-        h_ans = hidden.gather(1, idx_hidden)                     # [B, La_max, H]
-
-        # ----- memory forward and final logits -----
-        # memory: [B, La_max, H] -> [B, La_max, V]
-        #h_ans = h_ans.to(memory.device)
-        mem_logits = memory(h_ans)                               # [B, La_max, V]
-        #final_logits = base_ans_logits + eta * mem_logits        # [B, La_max, V]
-        #final_logits = base_ans_logits + mem_logits 
-        final_logits = mem_logits
+        shift_logits = out["logits"]
 
         # ----- CE over gold answer tokens (masking padding) -----
-        mask_flat = torch.where(answer_mask.view(-1))                         # [B*La_max]
-        gold_flat = answer_ids.view(-1)[mask_flat]               # [N_tokens]
-        logits_flat = final_logits.view(-1, V)[mask_flat]        # [N_tokens, V]
+        #mask_flat = torch.where(answer_mask.view(-1))                         # [B*La_max]
+        shift_labels = base_inputs['input_ids'][:, 1:]
+        shift_logits = shift_logits[:, :-1, :]
+        shift_label_mask = answer_mask[:, 1:]
+        gold_flat = shift_labels[shift_label_mask]               # [N_tokens]
+        logits_flat = shift_logits[shift_label_mask]         # [N_tokens, V]
 
         ce_loss = F.cross_entropy(logits_flat, gold_flat)
+        del shift_logits
+        del out
 
-        # ----- KL (teacher top-K + tail vs student) -----
-        # Teacher probabilities
-        p_t_topk = teacher_logprob.exp()                         # [B, La_max, K]
-        p_t_tail = tail_logprob.exp()                            # [B, La_max]
+        kd_loss = compute_seqkd_or_mml_loss(model=model,model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, retrieval_sims_list=ret_scores, answer_ids_top32_list=teacher_ids, answer_logp_top32_list=teacher_logprob, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True)
 
-        # Student probabilities
-        p_s = F.softmax(final_logits / TEMPERATURE, dim=-1)      # [B, La_max, V]
-        p_s_topk = p_s.gather(-1, teacher_ids)                   # [B, La_max, K]
-        p_s_tail = (1.0 - p_s_topk.sum(dim=-1)).clamp_min(1e-8)  # [B, La_max]
-
-        eps = 1e-8
-
-        # KL(p_t || p_s) over K+1 events: K explicit tokens + tail
-        kl_top = (p_t_topk * (teacher_logprob - torch.log(p_s_topk + eps))).sum(dim=-1)  # [B, La_max]
-        kl_tail = p_t_tail * (tail_logprob - torch.log(p_s_tail + eps))                  # [B, La_max]
-        kl = kl_top + kl_tail                                                            # [B, La_max]
-
-        kl_flat = kl.view(-1)[mask_flat]
-        kl_loss = kl_flat.mean()
-
-        # ----- total loss and step -----
-        loss = KL_WEIGHT * kl_loss + ALPHA_CE * ce_loss
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(list(memory.parameters()), max_norm=1.0)
+        loss = kd_loss*KL_WEIGHT + ce_loss * ALPHA_CE
+        #loss = ce_loss
+        accelerator.backward(loss)
+        params_to_clip = [p for g in optimizer.param_groups for p in g["params"]]
+        torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=1.0)
         optimizer.step()
         scheduler.step()
 
     with torch.no_grad():
         stats = {
             "loss": float(loss.item()),
-            "kl": float(kl_loss.item()),
+            "kl": float(kd_loss.item()),
+            #"kl": 0.,
             "ce": float(ce_loss.item()),
             #"delta": float(delta_loss.item()) if BETA_DELTA > 0 else 0.0,
             #"eta": float(eta.sigmoid().item()) if not USE_RESIDUAL else float(eta.item()),
         }
     return stats
 
+
 prompt_base = "Answer the image related question. For many fact checking questions, the desired answer would be named entities instead of common concept, for example \"Mount Everest\" instead of \"mountain top\", \"River Thames\" instead of \"river\". Be concise, output the answer only, without any additional words."
 prompt_teacher = "Answer the image related question. For many fact checking questions, the desired answer would be named entities instead of common concept, for example \"Mount Everest\" instead of \"mountain top\", \"River Thames\" instead of \"river\". Be concise, output the answer only, without any additional words. An additional image is provided for your reference, but it is not guaranteed to be relevant to original question."
 
-def process_input_test(processor, question, qimg, ret_image=None):
-
-    if not ret_image:
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "image": qimg,
-                    },
-                    {"type": "text", "text": prompt_base + "\nQuestion: " +question},
-                ],
-            }
+def process_input_test(processor, question_batch, qimg_batch, ret_image=None):
+    messages = []
+    for question, qimg in zip(question_batch, qimg_batch):
+        if not ret_image:
+            temp = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": qimg,
+                        },
+                        {"type": "text", "text": prompt_base + "\nQuestion: " +question},
+                    ],
+                }
+                ]
+        else:
+            temp = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": qimg,
+                        },
+                        {"type": "text", "text": prompt_teacher + "\nQuestion: " +question + "Additional Image:\n"},
+                        {
+                            "type": "image",
+                            "image": ret_image,
+                        }
+                    ],
+                }
             ]
-    else:
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "image": qimg,
-                    },
-                    {"type": "text", "text": prompt_teacher + "\nQuestion: " +question + "Additional Image:\n"},
-                    {
-                        "type": "image",
-                        "image": ret_image,
-                    }
-                ],
-            }
-        ]
+        messages.append(temp)
 
     # Preparation for inference
     text_inputs = processor.apply_chat_template(
@@ -272,7 +219,7 @@ def process_input_test(processor, question, qimg, ret_image=None):
         #return_tensors="pt"
         )
     
-    inputs = processor(images=qimg, text=text_inputs, padding=True, return_tensors='pt')
+    inputs = processor(images=qimg_batch, text=text_inputs, padding=True, padding_side="left", return_tensors='pt')
     #inputs.pop("token_type_ids", None)   # per model card snippet
     #inputs = inputs.to(teacher.device)
     return inputs
@@ -370,9 +317,23 @@ def process_input(processor:Qwen3VLProcessor, questions, qimgs, answers, ret_ima
     #input_lengths = inputs['attention_mask'].sum(dim=1)
     input_lengths = first_subsequence_pos(inputs['input_ids'], ASSISTANT_TOKENS)
     assert -1 not in input_lengths
+
+    B, T = inputs.input_ids.shape
+    answer_lengths = torch.tensor(answer_lengths, dtype=torch.long)
+    end = input_lengths + answer_lengths  # end-exclusive
+
+    # Optional safety (recommended): clamp to valid range
+    start = input_lengths.clamp(0, T)
+    end = end.clamp(0, T)
+
+    diff = torch.zeros((B, T + 1), dtype=torch.long)
+    diff.scatter_add_(1, start[:, None], torch.ones((B, 1), dtype=diff.dtype))
+    diff.scatter_add_(1, end[:, None], -torch.ones((B, 1), dtype=diff.dtype))
+    mask = diff.cumsum(dim=1)[:, :T] > 0
+    label_mask = torch.zeros_like(inputs.input_ids, dtype=torch.bool).masked_fill(mask, True)
     #inputs.pop("token_type_ids", None)   # per model card snippet
     #inputs = inputs.to(teacher.device)
-    return inputs, input_lengths, answer_ids, answer_mask, answer_lengths
+    return inputs, input_lengths, answer_ids, label_mask, answer_lengths
 
 
 def process_teacher_batch(mix_idx, mix_logp, tail_logp, answer_lengths:list[int]):
@@ -393,54 +354,61 @@ def process_teacher_batch(mix_idx, mix_logp, tail_logp, answer_lengths:list[int]
 
 
 def main():
-    train_ds = datasets.load_from_disk('/data_external/InfoSeek/train_combined').with_format('torch')
+    train_ds = datasets.load_from_disk('/data_external/InfoSeek/train_gen_combined').with_format('torch')
     #train_ds = train_ds.cast_column("image", HFImage(decode=True))
     #train_ds = train_ds.select(range(100000))
     test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_combined').with_format('torch')
 
+    base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16, device_map='cpu')
 
-    model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16, device_map='cpu')
+    #base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="eager", dtype=torch.float16, device_map='cpu')
 
-    # device_map = infer_auto_device_map(
-    #     model,
-    #     max_memory={0: "10GiB", 1: "10GiB"},  # adapt to your hardware
-    #     no_split_module_classes=["Qwen3VLTextDecoderLayer"],  # example
-    # )
-    # model = dispatch_model(model, device_map=device_map)
-    for p in model.parameters():
+    for p in base_model.parameters():
         p.requires_grad_(False)
-    #teacher = Qwen2_5_VLForConditionalGeneration.from_pretrained("/data_external/qwen2.5_vl_7b_instruct", local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16).cuda()
     processor = AutoProcessor.from_pretrained('/wyy/models/Qwen3-VL-8B-Instruct')
 
-    #retriever = AutoModel.from_pretrained("/data_external/bge_vl_large", trust_remote_code=True, local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16, device_map='cuda')
-    #retriever = retriever.cuda()
-    #retriever.set_processor("/data_external/bge_vl_large")
     memory = MemoryMLP()
-    saved_dict = torch.load('/data_external/MMPMem/checkpoints/13.pt')
-    memory.load_state_dict(saved_dict, strict=True)
-    # memory_device_map = {
-    #     "blocks.0": "cuda:0",
-    #     "blocks.1": "cuda:0",
-    #     "blocks.2": "cuda:0",
-    #     "blocks.3": "cuda:0",
-    #     "blocks.4": "cuda:1",
-    #     "head": "cuda:1"
-    # }
-    # memory = dispatch_model(memory, device_map=memory_device_map)
-    #memory = memory.to('cuda:1')
-    #total_params = sum(p.numel() for p in memory.parameters())
-    #index = faiss.read_index('/data_external/MRAG/bge.index')
+    for p in memory.parameters():
+        p.requires_grad_(True)
 
-    # Optional: learnable global scale for how much to trust memory residual
-    #eta = torch.nn.Parameter(torch.tensor(0.5, device=device))
-    def collate(x):
-        return {k: [e[k] for e in x] for k in x[0].keys()}
+    # saved_dict = torch.load('/data_external/MMPMem/checkpoints/step5000_cekd.pt')
+    # memory.load_state_dict(saved_dict, strict=True)
 
-    train_ds = DataLoader(train_ds, batch_size=MACRO_BATCH_SIZE, shuffle=True, collate_fn=collate, num_workers=4, prefetch_factor=1,)
-    test_ds = DataLoader(test_ds, batch_size=1, collate_fn=collate)
+    model = WrappedLM(base_model, memory, config=base_model.config, processor=processor, layer_idx_for_mem=HID_LAYER_ID)
 
-    optimizer = torch.optim.AdamW(list(memory.parameters()), lr=1e-5)
-    num_warmup_steps = 500
+
+    def collate_train(batch):
+        row = {k: [e[k] for e in batch] for k in batch[0].keys()}
+        question = row['question']
+        qimg = row['image']
+        answers = row['answer']
+        longest_answers = [max(answer, key=len)+processor.tokenizer.eos_token+'\n' for answer in answers]
+        #qid = row['data_id']
+
+        inputs, input_lengths, answer_ids, answer_mask, answer_lengths = process_input(processor, question, qimg, longest_answers)
+        #teacher_ids_with, teacher_logprob_with, tail_logprob = process_teacher_batch(row['mix_idx'], row['mix_logp'], row['tail_logp'], answer_lengths)
+        
+        teacher_ids = row['per_ev_top_ids']
+        teacher_logps = row['per_ev_top_logps']
+        for i in range(len(teacher_ids)):
+            pad_pos = teacher_ids[i] == -1
+            teacher_ids[i][pad_pos] = processor.tokenizer.pad_token_id
+        teacher_tails = row['per_ev_tail']
+        ret_scores = row['scores']
+        return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores
+
+    def collate_eval(batch):
+        row = {k: [e[k] for e in batch] for k in batch[0].keys()}
+        question = row['question']
+        qimg = row['image']
+        base_inputs = process_input_test(processor, question, qimg).to(model.device)
+        return base_inputs, row['answer_eval']
+
+    train_ds = DataLoader(train_ds, batch_size=MACRO_BATCH_SIZE, shuffle=True, collate_fn=collate_train, num_workers=6, prefetch_factor=2,)
+    test_ds = DataLoader(test_ds, batch_size=MACRO_BATCH_SIZE, collate_fn=collate_eval)
+
+    
+    num_warmup_steps = 200
     num_training_steps = len(train_ds)*20
     def lr_lambda(step: int, m_start=1e-7, m_min=1e-6) -> float:
         # Clamp step to [0, num_training_steps] for safety
@@ -457,101 +425,57 @@ def main():
         progress = (step - num_warmup_steps) / denom  # in [0,1]
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1 -> 0
         return m_min + (1.0 - m_min) * cosine
+    optimizer = torch.optim.AdamW(list(memory.parameters()), lr=LR)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    #accel = Accelerator()
-    #model, memory, optimizer,scheduler, train_ds, test_ds = accel.prepare(model, memory, optimizer, scheduler, train_ds, test_ds)
-    model = model.to('cuda')
-    memory = memory.to('cuda')
 
-    #if accel.is_main_process:
-    #   wandb_run = wandb.init(project="MMMem", name="same_teacher_replace")
+    from accelerate.utils import DistributedDataParallelKwargs
+    ddp = DistributedDataParallelKwargs(
+        broadcast_buffers=False        # critical
+    )
+    accel = Accelerator(kwargs_handlers=[ddp])
+    model, optimizer,scheduler, train_ds, test_ds = accel.prepare(model, optimizer, scheduler, train_ds, test_ds)
 
-    model.eval()
-    memory.eval()
-    correct = torch.tensor(0., device=model.device)
-    cb = torch.tensor(0., device=model.device)
-    all_gt = []
-    all_pred =  []
-    all_pred_base = []
-    for row in tqdm(test_ds):
-        question = row['question'][0]
-        qimg = row['image']
-        #answer_id = row['answer']
-        #answer_id = processor.tokenizer.encode(answer_id)
-        base_inputs = process_input_test(processor, question, qimg).to(model.device)
-        with torch.inference_mode():
-            gid, text, text_base = generate_with_memory(model, memory, processor.tokenizer, base_inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=0.0001)
-        #answer_first = answer_id[0]
-        #correct += processor.tokenizer._convert_id_to_token(answer_first).lower() == processor.tokenizer._convert_id_to_token(gid.item()).lower()
+    unw_model = accel.unwrap_model(model)
+    _memory = unw_model.memory
+    
+    if accel.is_main_process:
+        wandb_run = wandb.init(project="MMMem", name="CE+KD")
 
-        # gt = ast.literal_eval(row['answer_eval'])
-        gt = row['answer_eval'][0]
-        if '{' in gt[0] and '}' in gt[0]:
-            gt = ast.literal_eval(gt[0])
-        #correct += gt.lower() == text.lower()
-        score = score_infoseek(text_base, gt)
-        score_m = score_infoseek(text, gt)
-        cb += score['acc']
-        correct += score_m['acc']
-        #cb += gt.lower() == text_base.lower()
-        all_gt.append(gt)
-        all_pred.append(text)
-        all_pred_base.append([question, gt, text_base])
+    # model.eval()
+    # correct = torch.tensor(0., device=model.device)
+    # cb = torch.tensor(0., device=model.device)
+    # all_gt = []
+    # all_pred =  []
+    # all_pred_base = []
+    # for row in tqdm(test_ds):
+    #     inputs, gts = row
+    #     with torch.inference_mode():
+    #         output_ids = model.generate(**inputs, mix_mode='mem')
+    #         input_len = inputs.input_ids.size(1)
+    #         generated_ids = output_ids[:, input_len:]
+    #         text = processor.batch_decode(generated_ids, skip_special_tokens=True)
 
-    # # print(f"Ep -1: val acc: {cb/1000} | val base: {cb/1000}")
-    # accel.wait_for_everyone()
-    # xx = accel.gather(cb)
-    # cb = accel.reduce(cb, reduction="sum").item()
+    #     for gt, pred in zip(gts, text):
+    #         if '{' in gt[0] and '}' in gt[0]:
+    #             gt = ast.literal_eval(gt[0])
+    #         score_m = score_infoseek(pred, gt)
+    #         correct += score_m['acc']
+    #         all_gt.append(gt)
+    #         all_pred.append(pred)
     
     # if accel.is_main_process:
-    #     wandb_run.log({'eval/acc': cb/1000, 'eval/acc_base':cb/1000, 'eval/epoch': 0})
+    #     wandb_run.log({'eval/acc': correct/1000, 'eval/acc_base':correct/1000, 'eval/epoch': 0})
     # 14.90
 
 
     for ep in range(20):
-        model.eval()
-        memory.train()
+        model.train()
         acc_loss = []
         pbar = tqdm(train_ds)
-        batch_buffer = []
-        teacher_buffer = []
-        batch_step = 0
-        for step, row in enumerate(train_ds):
-            # if row['teacher_logits'] is None:
-            #     continue
-            # teacher_logits = row['teacher_logits']
-            question = row['question']
-            qimg = row['image']
-            answers = row['answer']
-            #answers = [ast.literal_eval(answer) for answer in answers]
-            longest_answers = [max(answer, key=len)+processor.tokenizer.eos_token+'\n' for answer in answers]
-            qid = row['data_id']
-
-            # try:
-            #     teacher_logits = torch.load(f'/data_external/SKVQA/DataStore_rep/{qid}.pt')
-            # except FileNotFoundError:
-            #     #print(f'qid{qid} teacher logit not found')
-            #     continue
-            # batch_buffer.append([question, qimg, longest_answer])
-            # teacher_buffer.append(teacher_logits)
-            # if batch_step == MACRO_BATCH_SIZE-1 or step == len(train_ds)-1:
-            #     inputs, input_lengths, answer_ids, answer_mask, answer_lengths = process_input(processor, question, qimg, longest_answers)#.to(model.device)
-            #     teacher_ids_with, teacher_logprob_with, tail_logprob = process_teacher_batch(teacher_buffer, answer_lengths)
-
-            #     batch_buffer.clear()
-            #     teacher_buffer.clear()
-            #     batch_step = 0
-            # else:
-            #     batch_step +=1
-            #     continue
-
-            inputs, input_lengths, answer_ids, answer_mask, answer_lengths = process_input(processor, question, qimg, longest_answers)#.to(model.device)
-            teacher_ids_with, teacher_logprob_with, tail_logprob = process_teacher_batch(row['mix_idx'], row['mix_logp'], row['tail_logp'], answer_lengths)
-
-            #teacher_logits = {k:v.cuda() if isinstance(v, torch.Tensor) else v for k,v in teacher_logits.items()}
-
-            stats = train_step(model, memory, optimizer,scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask, teacher_ids_with, teacher_logprob_with, tail_logprob)
+        for step, batch in enumerate(train_ds):
+            inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores = batch
+            stats = train_step(model,unw_model.config, accel, processor, optimizer,scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  teacher_ids, teacher_logps, teacher_tails, ret_scores)
 
             acc_loss.append(stats['loss'])
             cur_loss = np.mean(acc_loss)
@@ -570,57 +494,62 @@ def main():
             if step%5 == 0:
                 torch.cuda.empty_cache()
 
+            if step%1000 == 0:
+                accel.wait_for_everyone()
+                state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
+                if accel.is_main_process:
+                    torch.save(state, f"/data_external/MMPMem/checkpoints/step{step}_cekd.pt")
+
         accel.wait_for_everyone()
-        state = accel.get_state_dict(memory)         # gathered on rank 0, offloaded to CPU
+        state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
         if accel.is_main_process:
-            torch.save(state, f"/data_external/MMPMem/checkpoints/{ep}.pt")
+            torch.save(state, f"/data_external/MMPMem/checkpoints/{ep}_ce_only.pt")
         accel.wait_for_everyone()
 
+        # saved_dict = torch.load('/data_external/MMPMem/checkpoints/0_ce_only.pt')
+        # memory.load_state_dict(saved_dict, strict=True)
         model.eval()
-        memory.eval()
         correct =torch.tensor(0., device=model.device)
         em = 0
         cb = torch.tensor(0., device=model.device)
         eb = 0
         for row in tqdm(test_ds):
-            question = row['question'][0]
-            qimg = row['image']
-            #answer_id = row['answer']
-            #answer_id = processor.tokenizer.encode(answer_id)
-            base_inputs = process_input_test(processor, question, qimg).to(model.device)
+            inputs, gts = row
             with torch.inference_mode():
-                gid, text, text_base = generate_with_memory(model, memory, processor.tokenizer, base_inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=0.4)
-            #answer_first = answer_id[0]
-            #correct += processor.tokenizer._convert_id_to_token(answer_first).lower() == processor.tokenizer._convert_id_to_token(gid.item()).lower()
+                output_ids = model.module.generate(**inputs, mix_mode='mix')
+                input_len = inputs.input_ids.size(1)
+                generated_ids = output_ids[:, input_len:]
+                text = processor.batch_decode(generated_ids, skip_special_tokens=True)
 
-            #gt = ast.literal_eval(row['answer'])
-            gt = row['answer_eval'][0]
-            if '{' in gt[0] and '}' in gt[0]:
+            for gt, pred in zip(gts, text):
+                if '{' in gt[0] and '}' in gt[0]:
                     gt = ast.literal_eval(gt[0])
-            #correct += gt.lower() == text.lower()
-            #cb += gt.lower() == text_base.lower()
-            # all_gt.append(gt)
-            # all_pred.append(text)
-            # all_pred_base.append(text_base)
-            score = score_infoseek(text, gt)
-            sb = score_infoseek(text_base, gt)
-            correct += score['acc']
-            #em += score['em']
-            cb += sb['acc']
-            #eb += sb['em']
-        
+                score_m = score_infoseek(pred, gt)
+                correct += score_m['acc']
 
         print(f"Ep {ep}: val acc: {correct/1000} | val em: {em/1000}")
         accel.wait_for_everyone()
         correct = accel.reduce(correct, reduction="sum").item()
-        cb = accel.reduce(cb, reduction="sum").item()
+        #cb = accel.reduce(cb, reduction="sum").item()
         if accel.is_main_process:
             wandb_run.log({'eval/acc': correct/1000})
             #wandb_run.log({'eval/em': em/1000})
-            wandb_run.log({'eval/acc_base': cb/1000})
+            #wandb_run.log({'eval/acc_base': cb/1000})
             #wandb_run.log({'eval/em_base': eb/1000})
             wandb_run.log({'eval/epoch': ep+1})
+        pass
+
+def set_determinism(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+
 
 
 if __name__ == "__main__":
+    set_determinism(2026)
     main()
