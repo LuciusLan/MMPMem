@@ -108,10 +108,10 @@ def _repeat_dynamic_cache(base_cache: Union[Any,DynamicCache], repeat: int) -> A
         raise RuntimeError("DynamicCache is not available; install a recent transformers version.")
 
     #new_cache = copy.deepcopy(base_cache)
-    #new_cache.batch_repeat_interleave(repeat)
-    new_cache = None
+    base_cache.batch_repeat_interleave(repeat)
+    #new_cache = None
 
-    return new_cache
+    return base_cache
 
 def _get_qwen3vl_image_nums_from_input_ids(
     input_ids: torch.Tensor,
@@ -313,8 +313,148 @@ def compute_candidate_log_weights(
 
     logw = log_alpha + (agg_logp / float(tau_teacher))
     logw = logw.masked_fill(~candidate_mask, float("-inf"))
-    return logw
+    return logw, log_alpha
 
+def marginalize_first_token_logp(
+    *,
+    answer_ids_top32_list: List[torch.Tensor],          # each [K_b, L_b, 32]
+    answer_logp_top32_list: List[torch.Tensor],         # each [K_b, L_b, 32]
+    tail_mass_list: Optional[List[torch.Tensor]] = None,# each [K_b, L_b], optional
+    retrieval_sims_list: Optional[List[torch.Tensor]] = None,       # each [K_b]
+    candidate_log_weights_list: Optional[List[torch.Tensor]] = None,# each [K_b]
+    normalize_candidate_weights: bool = True,
+    tau_retrieval: float = 1.0,
+    candidate_mask_list: Optional[List[torch.Tensor]] = None,       # each [K_b] bool
+) -> Tuple[List[torch.Tensor], List[torch.Tensor], Optional[List[torch.Tensor]]]:
+    """
+    Marginalize the first-token distribution across candidates.
+
+    For each example b:
+        q_b(v) = sum_k w_{b,k} * p_teacher(v | candidate k, first position)
+
+    where p_teacher is represented sparsely by top-32 ids/logprobs at the first position.
+
+    Returns:
+        merged_first_token_ids_list:
+            list of [N_b] unique token ids
+        merged_first_token_log_probs_list:
+            list of [N_b] log-probs for those token ids
+        merged_first_token_tail_log_mass_list:
+            list of [] scalar log tail-mass, if tail_mass_list is provided; else None
+
+    Notes:
+    - This function marginalizes only the first-token distribution.
+    - `tail_mass_list[b][k, 0]` is assumed to be the teacher's leftover probability mass
+      after the stored top-32 tokens at the first position.
+    - If `candidate_log_weights_list` is provided, it is used directly.
+      Otherwise `retrieval_sims_list` must be provided.
+    - If `normalize_candidate_weights=True`, candidate weights are normalized per example
+      with log_softmax (recommended).
+    """
+
+    if candidate_log_weights_list is None and retrieval_sims_list is None:
+        raise ValueError("Provide either candidate_log_weights_list or retrieval_sims_list.")
+
+    B = len(answer_ids_top32_list)
+    assert len(answer_logp_top32_list) == B
+    if tail_mass_list is not None:
+        assert len(tail_mass_list) == B
+    if retrieval_sims_list is not None:
+        assert len(retrieval_sims_list) == B
+    if candidate_log_weights_list is not None:
+        assert len(candidate_log_weights_list) == B
+    if candidate_mask_list is not None:
+        assert len(candidate_mask_list) == B
+
+    merged_ids_list: List[torch.Tensor] = []
+    merged_logp_list: List[torch.Tensor] = []
+    merged_tail_list: List[torch.Tensor] = []
+
+    for b in range(B):
+        ids_b = answer_ids_top32_list[b]         # [K_b, L_b, 32]
+        logp_b = answer_logp_top32_list[b]       # [K_b, L_b, 32]
+        device = ids_b.device
+
+        Kb = ids_b.shape[0]
+        if Kb == 0:
+            merged_ids_list.append(torch.empty(0, dtype=torch.long, device=device))
+            merged_logp_list.append(torch.empty(0, dtype=logp_b.dtype, device=device))
+            if tail_mass_list is not None:
+                merged_tail_list.append(torch.tensor(float("-inf"), dtype=logp_b.dtype, device=device))
+            continue
+
+        if candidate_mask_list is None:
+            cand_mask = torch.ones(Kb, dtype=torch.bool, device=device)
+        else:
+            cand_mask = candidate_mask_list[b].to(device=device, dtype=torch.bool)
+
+        # ---- candidate log weights ----
+        if candidate_log_weights_list is not None:
+            logw = candidate_log_weights_list[b].to(device=device, dtype=logp_b.dtype)  # [K_b]
+        else:
+            sims = retrieval_sims_list[b].to(device=device, dtype=logp_b.dtype) / float(tau_retrieval)
+            sims = sims.masked_fill(~cand_mask, float("-inf"))
+            logw = sims
+
+        logw = logw.masked_fill(~cand_mask, float("-inf"))
+
+        if normalize_candidate_weights:
+            logw = F.log_softmax(logw, dim=0)  # [K_b]
+
+        # ---- first-position sparse teacher distribution ----
+        first_ids = ids_b[:, 0, :]    # [K_b, 32]
+        first_logp = logp_b[:, 0, :]  # [K_b, 32]
+
+        # Aggregate q(v) = sum_k w_k p_k(v) over duplicate token ids
+        acc = {}  # token_id -> logprob
+        for k in range(Kb):
+            if not cand_mask[k] or not torch.isfinite(logw[k]):
+                continue
+
+            ids_k = first_ids[k]      # [32]
+            logp_k = first_logp[k]    # [32]
+
+            # In case the same token id appears multiple times in top-32 (rare), merge within candidate first
+            local_acc = {}
+            for t in range(ids_k.shape[0]):
+                tok = int(ids_k[t].item())
+                val = logw[k] + logp_k[t]
+                if tok in local_acc:
+                    local_acc[tok] = torch.logaddexp(local_acc[tok], val)
+                else:
+                    local_acc[tok] = val
+
+            # Merge into global accumulator
+            for tok, val in local_acc.items():
+                if tok in acc:
+                    acc[tok] = torch.logaddexp(acc[tok], val)
+                else:
+                    acc[tok] = val
+
+        if len(acc) == 0:
+            merged_ids = torch.empty(0, dtype=torch.long, device=device)
+            merged_logp = torch.empty(0, dtype=logp_b.dtype, device=device)
+        else:
+            toks = sorted(acc.keys())
+            merged_ids = torch.tensor(toks, dtype=torch.long, device=device)
+            merged_logp = torch.stack([acc[t] for t in toks], dim=0)
+
+        merged_ids_list.append(merged_ids)
+        merged_logp_list.append(merged_logp)
+
+        # ---- optional marginalized tail mass ----
+        if tail_mass_list is not None:
+            tail_b = tail_mass_list[b].to(device=device, dtype=logp_b.dtype)  # [K_b, L_b]
+            first_tail = tail_b[:, 0]  # [K_b]
+
+            tail_terms = logw + first_tail
+            tail_terms = tail_terms.masked_fill(~cand_mask, float("-inf"))
+            merged_tail = torch.logsumexp(tail_terms, dim=0)  # scalar
+            merged_tail_list.append(merged_tail)
+
+    if tail_mass_list is not None:
+        return merged_ids_list, merged_logp_list, merged_tail_list
+    return merged_ids_list, merged_logp_list, None
 
 # ----------------------------
 # Optional: merge duplicate candidate sequences (within each original query)
@@ -357,7 +497,6 @@ def merge_duplicate_candidates(
     for b in range(B):
         # dict: seq_tuple -> (logw_merged, representative_index)
         acc: Dict[Tuple[int, ...], Tuple[torch.Tensor, int]] = {}
-
         for k in range(K):
             if not torch.isfinite(logw[b, k]):
                 continue
@@ -373,7 +512,7 @@ def merge_duplicate_candidates(
             else:
                 prev_logw, rep_k = acc[key]
                 acc[key] = (torch.logaddexp(prev_logw, logw[b, k]), rep_k)
-
+                prev_logfirst, rep_k2 = acc[key]
         # Pack back
         keys = list(acc.keys())
         Kp = len(keys)
@@ -507,6 +646,34 @@ def mml_loss_from_seq_logp(
         return per_ex.mean()
     raise ValueError(f"Unknown reduction: {reduction}")
 
+def trim_excess_right_padding(x, pad_value=0):
+    """
+    Remove trailing columns that are entirely padding.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        2D right-padded tensor of shape [N, T].
+    pad_value : scalar
+        Padding value.
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor with redundant right-padding columns removed.
+    """
+    if x.dim() != 2:
+        raise ValueError("x must be a 2D tensor")
+
+    # True for columns that contain at least one non-pad value
+    keep_col = (x != pad_value).any(dim=0)
+
+    # If everything is padding, return an empty-width tensor
+    if not keep_col.any():
+        return x[:, :0]
+
+    last_valid_col = keep_col.nonzero(as_tuple=True)[0].max().item()
+    return x[:, :last_valid_col + 1]
 
 # ----------------------------
 # Convenience wrapper: compute logw from your saved tensors, then compute loss
@@ -521,11 +688,11 @@ def compute_student_seq_logp_qwen3vl(
     cand_tokens: torch.Tensor,        # [K, L] right-padded token ids (may include EOS)
     pad_id: int,
     eos_id: Optional[int],
-    chunk_size: int = 8,
+    chunk_size: int = 16,
     include_eos: bool = True,
     length_norm: Literal["none", "mean"] = "none",
     detach_prompt_cache: bool = False,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, Cache, torch.Tensor, torch.Tensor] :
     """
     Computes log p_S(y | original prompt for sample_index) for each candidate sequence y.
 
@@ -618,7 +785,10 @@ def compute_student_seq_logp_qwen3vl(
     # ---- 2) Score candidates in chunks, reusing the prompt cache ----
     prompt_attn = single["attention_mask"]  # [1, P]
     logp_first_dist = F.log_softmax(prompt_logits_last, dim=-1)  # [1, V]
+    prompt_position_ids = out_prompt.position_ids
 
+
+    cand_tokens = trim_excess_right_padding(cand_tokens, pad_id)
     mask_all = token_mask_right_padded(
         cand_tokens,
         pad_id=pad_id,
@@ -628,8 +798,10 @@ def compute_student_seq_logp_qwen3vl(
     msk_all = mask_all.to(torch.float32)
 
     student_seq_logp = cand_tokens.new_zeros((K,), dtype=torch.float32)
+    prefix_len = prompt_cache.get_seq_length()
 
     prompt_cache_clone = copy.deepcopy(prompt_cache)
+    prompt_cache_return =  copy.deepcopy(prompt_cache)
     for start in range(0, K, chunk_size):
         end = min(K, start + chunk_size)
         n = end - start
@@ -642,7 +814,8 @@ def compute_student_seq_logp_qwen3vl(
         cache_n = _repeat_dynamic_cache(prompt_cache_clone, n)
 
         ans_attn = msk.to(dtype=prompt_attn.dtype)  # [n, L]
-        #full_attn = torch.cat([prompt_attn.repeat(n, 1), ans_attn], dim=1)  # [n, P+L]
+        
+        full_attn = torch.cat([prompt_attn.repeat(n, 1), ans_attn], dim=1)  # [n, P+L]
 
         # Answer forward (no pixel_values required because prompt cache already encodes vision)
         # try:
@@ -655,10 +828,16 @@ def compute_student_seq_logp_qwen3vl(
         #     )
         #except Exception:
             # Fallback: some variants accept only the unprocessed attention mask
+        L = tok.size(1)
+        suffix_position_ids = prompt_position_ids[:,:,-1].unsqueeze(-1) +1
+        suffix_position_ids = suffix_position_ids + torch.arange(L, device=device).view(1, -1)
+        suffix_cache_position = torch.arange(prefix_len, prefix_len + L, device=device)
         out_ans = model(
             input_ids=tok,
-            attention_mask=ans_attn,
+            attention_mask=full_attn,
             past_key_values=cache_n,
+            position_ids=suffix_position_ids,
+            cache_position=suffix_cache_position,
             use_cache=False,
             return_dict=True,
             mix_mode='mem'
@@ -693,7 +872,7 @@ def compute_student_seq_logp_qwen3vl(
         del logp_rest_dist
         del seq_logp
 
-    return student_seq_logp
+    return student_seq_logp, prompt_cache_return, logp_first_dist, prompt_position_ids
 
 def build_prompt_only_masks(device, input_ids, attention_mask, label_mask, pad_id: int):
     """
@@ -871,3 +1050,220 @@ def compute_seqkd_or_mml_loss(
     if reduction == "mean":
         return loss_vec.mean()
     raise ValueError(f"Unknown reduction: {reduction}")
+
+def compute_loss_premerged_with_ce(
+    *,
+    model: torch.nn.Module,
+    model_config,
+    prompt_inputs: Dict[str, torch.Tensor],                    # BatchFeature-like dict, tensors with batch dim [B, ...]
+    label_mask:torch.Tensor,
+    answer_ids,
+    cand_tokens_batch,
+    logw_batch,
+    pad_id: int,
+    eos_id: Optional[int],
+    mode: Literal["seqkd", "mml"] = "mml",
+    merge_duplicates: bool = True,
+    # weighting hyperparameters
+    tau_retrieval: float = 1.0,
+    tau_teacher: float = 1.0,
+    teacher_confidence: Literal["none", "sum", "mean"] = "sum",
+    include_eos_in_teacher_conf: bool = True,
+    # student scoring
+    chunk_size: int = 8,
+    student_length_norm: Literal["none", "mean"] = "none",
+    detach_prompt_cache: bool = False,
+    # reduction
+    reduction: Literal["mean", "sum", "none"] = "mean",
+) -> torch.Tensor:
+    """
+    Same semantics as the previous version, but:
+      - prompt_inputs is a batched BatchFeature-like dict (tensors with leading batch dim B).
+      - teacher candidates (ids/logps) remain as per-example lists to avoid over-padding.
+
+    Student is always conditioned on the ORIGINAL query image+question in prompt_inputs[b].
+    Candidate answers come from amortized queries (retrieved images), weighted by retrieval similarity
+    (and optionally teacher confidence). Amortized images are never fed to the student.
+
+    Requires helper functions (unchanged from earlier):
+      - extract_top1_sequences_and_logp (list-supporting)
+      - compute_candidate_log_weights
+      - merge_duplicate_candidates
+      - compute_student_seq_logp_qwen3vl
+      - seq_kd_loss_from_seq_logp / mml_loss_from_seq_logp
+    """
+    # Infer batch size from input_ids
+    assert "input_ids" in prompt_inputs and "attention_mask" in prompt_inputs
+    device = model.device
+    B = int(prompt_inputs["input_ids"].shape[0])
+    prompt_attention_mask = build_prompt_only_masks(model.device, prompt_inputs["input_ids"], prompt_inputs["attention_mask"], label_mask, pad_id=pad_id)
+    #full_attn_mask = prompt_inputs['attention_mask']
+    prompt_inputs['attention_mask'] = prompt_attention_mask
+    assert len(cand_tokens_batch) == B
+    assert len(logw_batch) == B
+
+    # Extract top-1 realized sequences (index 0) per example
+    kd_losses: List[torch.Tensor] = []
+    ce_losses: List[torch.Tensor] = []
+
+    for b in range(B):
+        cand_tokens = cand_tokens_batch[b]
+        logw = logw_batch[b]
+        candidate_mask = None
+        if len(cand_tokens) == 0:
+            kd_losses.append(prompt_inputs["input_ids"].new_zeros((), dtype=torch.float32))
+            ce_losses.append(prompt_inputs["input_ids"].new_zeros((), dtype=torch.float32))
+            print("Empty candidate batch")
+            continue
+
+        # Student conditioned on ORIGINAL image+question for sample b
+        student_seq_logp, prompt_cache_return, logp_first_dist, prompt_position_ids = compute_student_seq_logp_qwen3vl(
+            model=model,
+            model_config=model_config,
+            prompt_inputs=prompt_inputs,
+            sample_index=b,
+            cand_tokens=cand_tokens,
+            pad_id=pad_id,
+            eos_id=eos_id,
+            chunk_size=chunk_size,
+            include_eos=True,
+            length_norm=student_length_norm,
+            detach_prompt_cache=detach_prompt_cache,
+        )  # [K']
+
+        prefix_len = prompt_cache_return.get_seq_length()
+        current_gt = answer_ids[b]
+        current_gt = trim_excess_right_padding(current_gt.unsqueeze(0), pad_id)
+        #single = _slice_text_batch_to_single(prompt_inputs, b)
+
+        L = current_gt.size(1)
+        suffix_position_ids = prompt_position_ids[:,:,-1].unsqueeze(-1) +1
+        suffix_position_ids = suffix_position_ids + torch.arange(L, device=device).view(1, -1)
+        suffix_cache_position = torch.arange(prefix_len, prefix_len + L, device=device)
+
+        ce_loss = compute_ce_loss_from_prefix_cache(
+            model=model,
+            ans_ids_1=current_gt,
+            attention_mask_1=torch.ones_like(current_gt),
+            ans_labels_1=current_gt,
+            suffix_position_ids=suffix_position_ids,
+            suffix_cache_position=suffix_cache_position,
+            prefix_cache=prompt_cache_return,
+            logp_first_dist=logp_first_dist,
+            )
+
+        if mode == "seqkd":
+            loss_b = seq_kd_loss_from_seq_logp(
+                student_seq_logp=student_seq_logp.unsqueeze(0),
+                logw=logw.unsqueeze(0),
+                candidate_mask=candidate_mask,
+                reduction="none",
+            ).squeeze(0)
+        elif mode == "mml":
+            loss_b = mml_loss_from_seq_logp(
+                student_seq_logp=student_seq_logp.unsqueeze(0),
+                logw=logw.unsqueeze(0),
+                candidate_mask=candidate_mask,
+                reduction="none",
+            ).squeeze(0)
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        kd_losses.append(loss_b)
+        ce_losses.append(ce_loss)
+        del prompt_cache_return
+
+    kd_losses = torch.stack(kd_losses, dim=0)  # [B]
+    ce_losses = torch.stack(ce_losses, dim=0)
+    if reduction == "none":
+        return kd_losses, ce_losses
+    if reduction == "sum":
+        return kd_losses.sum(), ce_losses.sum()
+    if reduction == "mean":
+        return kd_losses.mean(), ce_losses.mean()
+    raise ValueError(f"Unknown reduction: {reduction}")
+
+
+def compute_ce_loss_from_prefix_cache(
+    *,
+    model: torch.nn.Module,
+    # single-sample (batch=1) tensors for FULL sequence including answer, already compacted to remove pure padding columns
+    ans_ids_1: torch.Tensor,        # [1, S]
+    attention_mask_1: torch.Tensor,   # [1, S]
+    ans_labels_1: torch.Tensor,           # [1, S] with -100 for ignored tokens
+    # prefix cache built from tokens input_ids_1[:, :prefix_len]
+    suffix_position_ids,
+    suffix_cache_position,
+    prefix_cache: DynamicCache,
+    logp_first_dist: torch.Tensor, # [1, V] logits for the last prefix position (i.e., position prefix_len-1)
+    prefix_len: Optional[int] = None, # if None, inferred as first target idx
+    # options
+    reduction: Literal["mean", "sum"] = "mean",
+    length_norm: Literal["none", "mean"] = "mean",
+) -> torch.Tensor:
+    """
+    Computes teacher-forced CE over target (labels != -100) tokens using cached prefix.
+    The model never re-encodes the prefix (including vision); it only runs the answer segment.
+
+    Important alignment requirement:
+      prefix_cache and prefix_last_logits MUST correspond to the prefix up to first target token.
+    """
+    device = model.device
+    assert ans_ids_1.shape[0] == 1
+
+    L = ans_ids_1.shape[1]
+
+    # 1) Score the FIRST supervised token using prefix_last_logits (predicts token at position t_start)
+    first_token = ans_ids_1[:, 0]                                  # [1]
+    first_logp = logp_first_dist.gather(1, first_token.unsqueeze(1)).squeeze(1)  # [1]
+    nll_first = -(first_logp)  # [1]
+
+    # If L==1, we're done
+    if L == 1:
+        denom = attention_mask_1.sum() if length_norm == "mean" else 1.0
+        denom = torch.clamp(denom, min=1.0)
+        loss = nll_first.sum() / denom
+        return loss if reduction == "mean" else nll_first.sum()
+
+    # 2) Score remaining tokens by continuing from prefix_cache
+    # Note: passing past_key_values may mutate it; clone defensively.
+    cache = copy.deepcopy(prefix_cache)
+
+    # Build attention mask for the continuation. With past, most HF models accept either:
+    #   - full mask of length prefix_len + L
+    #   - or just the new tokens mask [1, L]
+    # Qwen3-VL is generally safest with the full concatenated mask.
+    if prefix_len is None:
+        prefix_len = cache.get_seq_length()
+    prefix_attn = torch.ones((1, prefix_len), device=device, dtype=attention_mask_1.dtype)
+    ans_attn = attention_mask_1
+    full_attn = torch.cat([prefix_attn, ans_attn], dim=1)  # [1, prefix_len + L]
+
+    # Forward on the full answer segment tokens. We will use logits[:, :-1] to score ans_ids[:, 1:].
+    out = model(
+        input_ids=ans_ids_1,
+        attention_mask=full_attn,
+        position_ids=suffix_position_ids,
+        cache_position=suffix_cache_position,
+        past_key_values=cache,
+        mix_mode="mem",
+        use_cache=True,
+        return_dict=True,
+    )
+    logits = out.logits  # [1, L, V]
+
+    # logits at index j predicts token at index j+1 in ans_ids
+    logp_dist = F.log_softmax(logits[:, :-1, :], dim=-1)          # [1, L-1, V]
+    next_tokens = ans_ids_1[:, 1:].unsqueeze(-1)                    # [1, L-1, 1]
+    next_logp = logp_dist.gather(-1, next_tokens).squeeze(-1)     # [1, L-1]
+    nll_rest = -(next_logp * attention_mask_1[:, 1:])                     # [1, L-1]
+
+    nll_total = nll_first.sum() + nll_rest.sum()
+
+    if length_norm == "mean":
+        denom = attention_mask_1.sum().clamp_min(1.0)
+        loss = nll_total / denom
+    else:
+        loss = nll_total
+
+    return loss

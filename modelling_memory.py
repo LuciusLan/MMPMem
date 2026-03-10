@@ -11,6 +11,12 @@ from transformers.utils import TransformersKwargs, auto_docstring, is_torchdynam
 from transformers import Qwen3VLForConditionalGeneration
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLCausalLMOutputWithPast, Qwen3VLModelOutputWithPast
 
+class Qwen3VLCausalLMOutputWithPast_Pos(Qwen3VLCausalLMOutputWithPast):
+    def __init__(self, *args, **kwargs):
+        position_ids =  kwargs.pop("position_ids", None)
+        super().__init__(*args, **kwargs)
+        self["position_ids"] = position_ids
+
 class SwiGLU(nn.Module):
     def __init__(self, d_in, d_up):
         super().__init__()
@@ -114,6 +120,27 @@ class WrappedLM(nn.Module, GenerationMixin):
 
     def get_input_embeddings(self):
         return self.base_model.get_input_embeddings()
+
+    def _update_model_kwargs_for_generation(
+        self,
+        outputs,
+        model_kwargs,
+        is_encoder_decoder=False,
+        num_new_tokens=1,
+    ):
+        # keep HF default behavior: cache, attention_mask, position_ids, cache_position, etc.
+        model_kwargs = super()._update_model_kwargs_for_generation(
+            outputs,
+            model_kwargs,
+            is_encoder_decoder=is_encoder_decoder,
+            num_new_tokens=num_new_tokens,
+        )
+
+        # add your custom state
+        if getattr(outputs, "position_ids", None) is not None:
+            model_kwargs["position_ids"] = outputs.position_ids
+
+        return model_kwargs
     
     def forward(
         self,
@@ -197,50 +224,22 @@ class WrappedLM(nn.Module, GenerationMixin):
             deepstack_visual_embeds = deepstack_video_embeds
 
         if position_ids is None:
-            attention_mask_tensor = (
-                attention_mask if not isinstance(attention_mask, dict) else attention_mask["full_attention"]
+            position_ids = self.base_lm.model.compute_3d_position_ids(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
             )
-            if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
-                attention_mask_tensor = torch.diagonal(attention_mask_tensor[:, 0], dim1=1, dim2=2)
-                # Only apply conversion for floating point tensors (inverted masks)
-                if attention_mask_tensor.dtype.is_floating_point:
-                    attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
-                    attention_mask_tensor = (1.0 - attention_mask_tensor).int()
-
-            # Calculate RoPE index once per generation in the pre-fill stage only.
-            # When compiling, we can't check tensor values thus we check only input length
-            # It is safe to assume that `length!=1` means we're in pre-fill because compiled
-            # models currently cannot do asssisted decoding
-            prefill_compiled_stage = is_torchdynamo_compiling() and (
-                (input_ids is not None and input_ids.shape[1] != 1)
-                or (inputs_embeds is not None and inputs_embeds.shape[1] != 1)
-            )
-            prefill_noncompiled_stage = not is_torchdynamo_compiling() and (
-                (cache_position is not None and cache_position[0] == 0)
-                or (past_key_values is None or past_key_values.get_seq_length() == 0)
-            )
-            if (prefill_compiled_stage or prefill_noncompiled_stage) or self.rope_deltas is None:
-                position_ids, rope_deltas = self.base_model.get_rope_index(
-                    input_ids,
-                    image_grid_thw,
-                    video_grid_thw,
-                    attention_mask=attention_mask_tensor,
-                )
-                self.rope_deltas = rope_deltas
-            # then use the prev pre-calculated rope-deltas to get the correct position ids
-            else:
-                batch_size, seq_length, _ = inputs_embeds.shape
-                delta = (
-                    (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
-                    if cache_position is not None
-                    else 0
-                )
-                position_ids = torch.arange(seq_length, device=inputs_embeds.device)
-                position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-                if cache_position is not None:  # otherwise `deltas` is an int `0`
-                    delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
-                position_ids = position_ids.add(delta)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+            if position_ids.size(0) ==3:
+                # [3, B, seq_len]
+                #text_pos_ids = torch.arange(position_ids.size(-1), dtype=torch.long, device=position_ids.device).unsqueeze(0).unsqueeze(0)
+                L = position_ids.size(-1)
+                prefix_lens = attention_mask.sum(dim=1).to(torch.long).unsqueeze(1)
+                text_pos = torch.arange(L, device=self.device, dtype=torch.long).unsqueeze(0).repeat(prefix_lens.size(0), 1)              # [B, K]
+                text_pos = (text_pos - (L - prefix_lens)).clamp_min(0).unsqueeze(0)
+                position_ids = torch.cat([text_pos,position_ids], dim=0)
         
         outputs:Qwen3VLModelOutputWithPast = self.base_model.language_model(
             input_ids=None,
@@ -283,10 +282,11 @@ class WrappedLM(nn.Module, GenerationMixin):
             raise AttributeError("Mix mode has to be either 'base', 'mem' or 'mix'.")
 
 
-        return Qwen3VLCausalLMOutputWithPast(
+        return Qwen3VLCausalLMOutputWithPast_Pos(
             loss=None,
             logits=logits,
             #hidden_states=outputs.hidden_states,
             past_key_values=outputs.past_key_values,
+            position_ids=position_ids
             #past_key_values=None,
         )
