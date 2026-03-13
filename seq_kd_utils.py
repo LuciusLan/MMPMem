@@ -315,6 +315,249 @@ def compute_candidate_log_weights(
     logw = logw.masked_fill(~candidate_mask, float("-inf"))
     return logw, log_alpha
 
+def compute_candidate_log_weights_for_cache(
+    retrieval_sims: torch.Tensor,
+    cand_tokens: torch.Tensor,
+    teacher_token_logp: Optional[torch.Tensor],
+    pad_id: int,
+    eos_id: Optional[int],
+    *,
+    candidate_mask: Optional[torch.Tensor] = None,
+    tau_retrieval: float = 1.0,
+    tau_teacher: float = 1.0,
+    teacher_confidence: Literal["none", "sum", "mean"] = "sum",
+    include_eos_in_teacher_conf: bool = True,
+    # NEW:
+    normalize: bool = True,
+    return_components: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """
+    Compute per-candidate log-weights.
+
+    Default behavior (normalize=True, return_components=False):
+      identical to the previous version:
+        logw_i = log_softmax(retrieval_sims / tau_retrieval)_i + agg_logp_i / tau_teacher
+
+    For caching / later temperature tuning:
+      set normalize=False and return_components=True.
+      Then the function returns:
+        retrieval_sims_raw: [B, K]
+        teacher_conf_raw:   [B, K] or None
+        combined_score:     [B, K]
+        candidate_mask:     [B, K]
+      where
+        combined_score_i = retrieval_sims_raw_i / tau_retrieval + teacher_conf_raw_i / tau_teacher
+      and NO log_softmax is applied.
+
+    Why this is the right quantity to cache:
+      - For both seq-KD and MML, only relative candidate weights matter.
+      - The log_softmax normalization over retrieval scores can be applied later at training runtime
+        after choosing top-K and temperatures.
+      - Duplicate-answer merging should be done with logaddexp over the *unnormalized* combined_score,
+        not over the normalized retrieval term, so that you can re-normalize after top-K / tau changes.
+
+    Shapes:
+      retrieval_sims:      [B, K] or [K]
+      cand_tokens:         [B, K, L] or [K, L]
+      teacher_token_logp:  [B, K, L] or [K, L] or None
+      candidate_mask:      [B, K] or [K] or None
+
+    Returns:
+      if return_components=False:
+        logw: [B, K] (or [1, K] if input was [K])
+
+      if return_components=True:
+        retrieval_sims_raw: [B, K]
+        teacher_conf_raw:   [B, K] or None
+        combined_score:     [B, K]
+        candidate_mask:     [B, K]
+    """
+    squeeze_batch = False
+    if retrieval_sims.dim() == 1:
+        retrieval_sims = retrieval_sims.unsqueeze(0)
+        cand_tokens = cand_tokens.unsqueeze(0)
+        if teacher_token_logp is not None:
+            teacher_token_logp = teacher_token_logp.unsqueeze(0)
+        if candidate_mask is not None:
+            candidate_mask = candidate_mask.unsqueeze(0)
+        squeeze_batch = True
+
+    if candidate_mask is None:
+        candidate_mask = torch.isfinite(retrieval_sims)
+    else:
+        candidate_mask = candidate_mask.to(dtype=torch.bool, device=retrieval_sims.device)
+
+    retrieval_sims_raw = retrieval_sims
+    teacher_conf_raw: Optional[torch.Tensor] = None
+
+    if teacher_confidence != "none":
+        if teacher_token_logp is None:
+            raise ValueError("teacher_token_logp must be provided when teacher_confidence != 'none'.")
+
+        tok_mask = token_mask_right_padded(
+            cand_tokens,
+            pad_id=pad_id,
+            eos_id=eos_id,
+            include_eos=include_eos_in_teacher_conf,
+        ).to(dtype=teacher_token_logp.dtype)  # [B, K, L]
+
+        sum_logp = (teacher_token_logp * tok_mask).sum(dim=-1)  # [B, K]
+
+        if teacher_confidence == "mean":
+            denom = tok_mask.sum(dim=-1).clamp_min(1.0)
+            teacher_conf_raw = sum_logp / denom
+        elif teacher_confidence == "sum":
+            teacher_conf_raw = sum_logp
+        else:
+            raise ValueError(f"Unknown teacher_confidence: {teacher_confidence}")
+
+    # Unnormalized combined score: this is what you should merge/cache if you want to tune tau / top-K later.
+    combined_score = retrieval_sims_raw / float(tau_retrieval)
+    if teacher_conf_raw is not None:
+        combined_score = combined_score + teacher_conf_raw / float(tau_teacher)
+
+    combined_score = combined_score.masked_fill(~candidate_mask, float("-inf"))
+
+    if return_components:
+        if squeeze_batch:
+            return (
+                retrieval_sims_raw.squeeze(0),
+                None if teacher_conf_raw is None else teacher_conf_raw.squeeze(0),
+                combined_score.squeeze(0),
+                candidate_mask.squeeze(0),
+            )
+        return retrieval_sims_raw, teacher_conf_raw, combined_score, candidate_mask
+
+    if not normalize:
+        return combined_score.squeeze(0) if squeeze_batch else combined_score
+
+    # Backward-compatible normalized behavior.
+    # Note: adding/subtracting a constant over candidates does not change seq-KD/MML after renormalization,
+    # but we keep the previous semantics here.
+    sims = (retrieval_sims_raw / float(tau_retrieval)).masked_fill(~candidate_mask, float("-inf"))
+    log_alpha = F.log_softmax(sims, dim=1)
+
+    logw = log_alpha
+    if teacher_conf_raw is not None:
+        logw = logw + teacher_conf_raw / float(tau_teacher)
+
+    logw = logw.masked_fill(~candidate_mask, float("-inf"))
+    return logw.squeeze(0) if squeeze_batch else logw
+
+def label_candidate(
+    cand_tokens: torch.Tensor,                 # [K, L] or [B, K, L]
+    gt: list[str]|dict,                   # [L_gt] or [B, L_gt]
+    retrieval_sims_raw: torch.Tensor,         # [K] or [B, K]
+    teacher_conf_raw: Optional[torch.Tensor], # [K] or [B, K] or None
+    candidate_mask: torch.Tensor,             # [K] or [B, K]
+    pad_id: int,
+    eos_id: Optional[int],
+    score_func,
+    tokenizer,
+    *,
+    tau_retrieval: float = 1.0,
+    tau_teacher: float = 1.0,
+    include_eos: bool = True,
+    return_debug: bool = False,
+):
+    from typing import Any, Dict, List, Optional, Tuple
+
+    squeeze_batch = False
+
+    # Normalize shapes independently
+    if cand_tokens.dim() == 2:   # [K, L] -> [1, K, L]
+        cand_tokens = cand_tokens.unsqueeze(0)
+        squeeze_batch = True
+    elif cand_tokens.dim() != 3:
+        raise ValueError(f"cand_tokens must be [K,L] or [B,K,L], got {cand_tokens.shape}")
+
+    if retrieval_sims_raw.dim() == 1:   # [K] -> [1, K]
+        retrieval_sims_raw = retrieval_sims_raw.unsqueeze(0)
+    elif retrieval_sims_raw.dim() != 2:
+        raise ValueError(f"retrieval_sims_raw must be [K] or [B,K], got {retrieval_sims_raw.shape}")
+
+    if candidate_mask.dim() == 1:       # [K] -> [1, K]
+        candidate_mask = candidate_mask.unsqueeze(0)
+    elif candidate_mask.dim() != 2:
+        raise ValueError(f"candidate_mask must be [K] or [B,K], got {candidate_mask.shape}")
+
+    if teacher_conf_raw is not None:
+        if teacher_conf_raw.dim() == 1:  # [K] -> [1, K]
+            teacher_conf_raw = teacher_conf_raw.unsqueeze(0)
+        elif teacher_conf_raw.dim() != 2:
+            raise ValueError(f"teacher_conf_raw must be [K] or [B,K], got {teacher_conf_raw.shape}")
+
+    B, K, L = cand_tokens.shape
+
+    assert retrieval_sims_raw.shape[0] == B, f"retrieval_sims_raw batch mismatch: {retrieval_sims_raw.shape[0]} vs {B}"
+    assert candidate_mask.shape[0] == B, f"candidate_mask batch mismatch: {candidate_mask.shape[0]} vs {B}"
+    if teacher_conf_raw is not None:
+        assert teacher_conf_raw.shape[0] == B, f"teacher_conf_raw batch mismatch: {teacher_conf_raw.shape[0]} vs {B}"
+
+    keep = False
+    debug: List[Dict[str, Any]] = []
+
+    for b in range(B):
+        score = retrieval_sims_raw[b] / float(tau_retrieval)  # [K]
+        if teacher_conf_raw is not None:
+            score = score + teacher_conf_raw[b] / float(tau_teacher)
+        score = score.masked_fill(~candidate_mask[b], float("-inf"))
+
+        merged = {}
+        num_valid = 0
+
+        for k in range(K):
+            if not torch.isfinite(score[k]).item():
+                continue
+            num_valid += 1
+
+            cand_mask_k = token_mask_right_padded(
+                cand_tokens[b, k],
+                pad_id=pad_id,
+                eos_id=eos_id,
+                include_eos=include_eos,
+            )
+            seq_k = tuple(cand_tokens[b, k][cand_mask_k].tolist())
+
+            if seq_k in merged:
+                merged[seq_k] = torch.logaddexp(merged[seq_k], score[k])
+            else:
+                merged[seq_k] = score[k]
+
+        if len(merged) == 0:
+            keep = False
+            if return_debug:
+                debug.append(
+                    {
+                        "top_seq": None,
+                        "top_score": float("-inf"),
+                        "gt_found": False,
+                        "gt_score": float("-inf"),
+                        "gt_rank": None,
+                        "top1_is_gt": False,
+                        "num_valid_candidates": 0,
+                        "num_merged_candidates": 0,
+                    }
+                )
+            continue
+
+        # Sort merged candidates by score descending
+        ranked = sorted(merged.items(), key=lambda kv: float(kv[1].item()), reverse=True)
+        norm_weights  = torch.tensor([e for e in merged.values()]).softmax(dim=0)
+        gt_rank = -1
+        gt_weight = -1
+        for idx, (seq, _) in enumerate(ranked):
+            seq_text = tokenizer.decode(seq, skip_special_tokens=True)
+            score =score_func(seq_text, gt)
+            if score['acc']>0:
+                if idx == 0:
+                    keep = True
+                gt_rank = idx
+                gt_weight = norm_weights[idx].item()
+                break
+
+    return keep, gt_rank, gt_weight
+
 def marginalize_first_token_logp(
     *,
     answer_ids_top32_list: List[torch.Tensor],          # each [K_b, L_b, 32]

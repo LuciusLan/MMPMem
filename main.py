@@ -39,7 +39,7 @@ from accelerate.utils import tqdm
 from modelling_memory import MemoryMLP, WrappedLM
 from inference import generate_with_memory
 from eval_util import score_infoseek
-from seq_kd_utils import compute_seqkd_or_mml_loss, extract_top1_sequences_and_logp, merge_duplicate_candidates, compute_candidate_log_weights, marginalize_first_token_logp, compute_loss_premerged_with_ce
+from seq_kd_utils import compute_seqkd_or_mml_loss, extract_top1_sequences_and_logp, merge_duplicate_candidates, compute_candidate_log_weights, marginalize_first_token_logp, compute_loss_premerged_with_ce, compute_candidate_log_weights_for_cache, label_candidate
 
 # ---------------------------
 # Hyperparameters & utilities
@@ -228,16 +228,16 @@ def train_step_premerged(model:WrappedLM, model_config, accelerator:Accelerator,
     return stats
 
 
-def get_stats_step(model:WrappedLM, processor, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, teacher_ids:torch.Tensor, teacher_logprob:torch.Tensor, tail_logprob:torch.Tensor, ret_scores:torch.Tensor):
+def get_stats_step(model:WrappedLM, processor, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, teacher_ids:torch.Tensor, teacher_logprob:torch.Tensor, tail_logprob:torch.Tensor, ret_scores:torch.Tensor, gt:str, score_func, tokenizer):
     base_inputs = {k :v.to(device) for k,v in base_inputs.items()}
     input_lengths= input_lengths.to(device)
     answer_ids = answer_ids.to(device)
     answer_mask = answer_mask.to(device)
 
-    teacher_ids = [e.to(device)[:10, :, :] for e in teacher_ids]
-    teacher_logprob = [e.to(device)[:10, :, :] for e in teacher_logprob]
-    ret_scores = [e[:10] for e in ret_scores]
-    tail_logprob = [e[:10, :] for e in tail_logprob]
+    teacher_ids = [e.to(device)[:29, :, :] for e in teacher_ids]
+    teacher_logprob = [e.to(device)[:29, :, :] for e in teacher_logprob]
+    ret_scores = [e.to(device)[:29] for e in ret_scores]
+    tail_logprob = [e.to(device)[:29, :] for e in tail_logprob]
 
     first_ids_list, first_logp_list, first_tail_list = marginalize_first_token_logp(
         answer_ids_top32_list=teacher_ids,
@@ -270,7 +270,7 @@ def get_stats_step(model:WrappedLM, processor, device, base_inputs: BatchFeature
 
         candidate_mask = torch.isfinite(retrieval_sims)
 
-        logw, log_alpha = compute_candidate_log_weights(
+        retrieval_sims_raw, teacher_conf_raw, combined_score, candidate_mask = compute_candidate_log_weights_for_cache(
             retrieval_sims=retrieval_sims.unsqueeze(0),                 # [1, K]
             cand_tokens=cand_tokens.unsqueeze(0),                       # [1, K, L]
             teacher_token_logp=teacher_token_logp.unsqueeze(0),         # [1, K, L]
@@ -281,24 +281,37 @@ def get_stats_step(model:WrappedLM, processor, device, base_inputs: BatchFeature
             tau_teacher=1.,
             teacher_confidence="sum",
             include_eos_in_teacher_conf=True,
+            return_components=True
         )  # [K]
-        logw = logw.squeeze(0)
-        log_alpha = log_alpha.squeeze(0)
 
-        logw = logw.masked_fill(~candidate_mask, float("-inf"))
-
-        cand_tokens_m, logw_m, _, cand_mask_m = merge_duplicate_candidates(
-            device=device,
-            cand_tokens=cand_tokens.unsqueeze(0),
-            logw=logw.unsqueeze(0),
-            student_seq_logp=None,
+        gt_is_ranked_top, gt_rank, top_weight = label_candidate(
+            cand_tokens=cand_tokens,
+            gt=gt,
+            retrieval_sims_raw=retrieval_sims_raw,
+            teacher_conf_raw=teacher_conf_raw,
+            candidate_mask=candidate_mask,
             pad_id=151643,
             eos_id=151645,
+            score_func=score_func,
+            tokenizer=tokenizer,
         )
-        cand_tokens = cand_tokens_m.squeeze(0)            # [K', L]
-        logw = logw_m.squeeze(0).exp()
-        merged_cand_tokens = processor.batch_decode(cand_tokens, skip_special_tokens=True)
-        return cand_tokens, merged_cand_tokens, cand_mask_m.squeeze(0), logw, first_ids_list, first_logp_list, first_tail_list
+        # logw = logw.squeeze(0)
+        # log_alpha = log_alpha.squeeze(0)
+
+        # logw = logw.masked_fill(~candidate_mask, float("-inf"))
+
+        # cand_tokens_m, logw_m, _, cand_mask_m = merge_duplicate_candidates(
+        #     device=device,
+        #     cand_tokens=cand_tokens.unsqueeze(0),
+        #     logw=logw.unsqueeze(0),
+        #     student_seq_logp=None,
+        #     pad_id=151643,
+        #     eos_id=151645,
+        # )
+        # cand_tokens = cand_tokens_m.squeeze(0)            # [K', L]
+        # logw = logw_m.squeeze(0).exp()
+        # merged_cand_tokens = processor.batch_decode(cand_tokens, skip_special_tokens=True)
+        return cand_tokens,retrieval_sims_raw, teacher_conf_raw,candidate_mask, first_ids_list, first_logp_list, first_tail_list, gt_is_ranked_top, gt_rank, top_weight
 
 
 prompt_base = "Answer the image related question. For many fact checking questions, the desired answer would be named entities instead of common concept, for example \"Mount Everest\" instead of \"mountain top\", \"River Thames\" instead of \"river\". Be concise, output the answer only, without any additional words."
@@ -487,27 +500,60 @@ def gen(input_ds, processor, device):
     pbar = tqdm(total=len(input_ds))
     for step, batch in enumerate(input_ds):
         inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores, eval_answer, data_id = batch
-        candidates, candidate_text, candidate_mask, logw, first_ids_list, first_logp_list, first_tail_list = get_stats_step(None, processor, device, inputs, input_lengths, answer_ids, answer_mask,  teacher_ids, teacher_logps, teacher_tails, ret_scores)
-        pbar.update()
+
         gt = eval_answer[0]
-        labels = []
-        #avg_len.append(len(candidate_text))
-        
-        # current_rank = []
-        # current_weight = []
-        candidate_has_correct = False
-        for i, cand_answer in enumerate(candidate_text):
-            if i==0:
-                if '{' in gt[0] and '}' in gt[0]:
-                    gt = ast.literal_eval(gt[0])
-            score = score_infoseek(cand_answer, gt)
-            labels.append(1 if score['acc']>0 else 0)
-            if score['acc'] > 0:
-                candidate_has_correct = True
-        if not candidate_has_correct:
-            continue
-        sample = {'data_id':data_id[0], 'merged_candidate_ids': candidates, 'merged_logw': logw, 'm_first_tok_id': first_ids_list[0], 'm_first_tok_logp':first_logp_list[0], 'm_first_tok_tail': first_tail_list[0], "candidate_has_correct": candidate_has_correct}
+        if '{' in gt[0] and '}' in gt[0]:
+            gt = ast.literal_eval(gt[0])
+        #score = score_infoseek(cand_answer, gt)
+
+        cand_tokens,retrieval_sims_raw, teacher_conf_raw,candidate_mask, first_ids_list, first_logp_list, first_tail_list, gt_is_ranked_top, gt_rank, top_weight = get_stats_step(model=None, processor=processor, device=device, base_inputs=inputs, input_lengths=input_lengths, answer_ids=answer_ids, answer_mask=answer_mask, teacher_ids=teacher_ids, teacher_logprob=teacher_logps, tail_logprob=teacher_tails, ret_scores=ret_scores, gt=gt, score_func=score_infoseek, tokenizer=processor.tokenizer)
+        pbar.update()
+       
+        sample = {'data_id':data_id[0], 'cand_tokens': cand_tokens, 'ret_scores': retrieval_sims_raw.squeeze(0), "sum_cand_logps": teacher_conf_raw.squeeze(0), "candidate_mask":candidate_mask.squeeze(0), 'm_first_tok_id': first_ids_list[0], 'm_first_tok_logp':first_logp_list[0], 'm_first_tok_tail': first_tail_list[0], "keep": gt_is_ranked_top, "candidate_gt_rank": gt_rank, "candidate_mass":top_weight, "gt": str(gt)}
         yield sample
+
+def process_ds():
+    train_ds = datasets.load_from_disk('/data_external/InfoSeek/train_gen_combined').with_format('torch')
+    #train_ds = train_ds.remove_columns(["per_ev_top_ids", "per_ev_top_logps", "per_ev_tail"])
+    processor = AutoProcessor.from_pretrained('/wyy/models/Qwen3-VL-8B-Instruct')
+    def collate_train_raw(batch):
+        row = {k: [e[k] for e in batch] for k in batch[0].keys()}
+        question = row['question']
+        qimg = row['image']
+        answers = row['answer']
+        longest_answers = [max(answer, key=len)+processor.tokenizer.eos_token+'\n' for answer in answers]
+        #qid = row['data_id']
+
+        inputs, input_lengths, answer_ids, answer_mask, answer_lengths = process_input(processor, question, qimg, longest_answers)        
+        teacher_ids = row['per_ev_top_ids']
+        teacher_logps = row['per_ev_top_logps']
+        for i in range(len(teacher_ids)):
+            pad_pos = teacher_ids[i] == -1
+            teacher_ids[i][pad_pos] = processor.tokenizer.pad_token_id
+        teacher_tails = row['per_ev_tail']
+        ret_scores = row['scores']
+        return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores, row['answer_eval'], row['data_id']
+
+    from datasets import Features, Sequence, Value 
+    features = Features({
+        "data_id": Value("string"),
+        "cand_tokens": Sequence(Sequence(Value("int64"))),
+        "ret_scores": Sequence(Value("float32")),
+        "sum_cand_logps": Sequence(Value("float32")),
+        "candidate_mask": Sequence(Value("bool")),
+        "m_first_tok_id": Sequence(Value("int64")),
+        "m_first_tok_logp": Sequence(Value("float32")),
+        "m_first_tok_tail": Value("float32"),
+        "keep": Value("bool"),
+        "candidate_gt_rank": Value("int64"),
+        "candidate_mass": Value("float32"),
+        "gt": Value("string"),
+    })
+
+    train_dl = DataLoader(train_ds, batch_size=1, shuffle=False, collate_fn=collate_train_raw, prefetch_factor=2, num_workers=6)
+    distil_dataset = HFDataset.from_generator(gen, features=features, gen_kwargs={'input_ds': train_dl, 'processor':processor, 'device': "cpu"})
+    distil_dataset.save_to_disk('/data_external/InfoSeek/distill_train')
+    return
 
 def main():
     train_ds = datasets.load_from_disk('/data_external/InfoSeek/train_gen_combined').with_format('torch')
@@ -804,4 +850,5 @@ def set_determinism(seed):
 
 if __name__ == "__main__":
     set_determinism(2026)
-    main()
+    #main()
+    process_ds()
