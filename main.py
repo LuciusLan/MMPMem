@@ -175,7 +175,7 @@ def train_step(model:WrappedLM, model_config, accelerator:Accelerator, processor
         }
     return stats
 
-def train_step_premerged(model:WrappedLM, model_config, accelerator:Accelerator, processor, optimizer,scheduler, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, cand_tokens_batch, logw_batch):
+def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerator, processor, optimizer,scheduler, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, cand_tokens, ret_scores, sum_cand_logps, candidate_mask):
     optimizer.zero_grad(set_to_none=True)
     base_inputs = {k :v.to(device) for k,v in base_inputs.items()}
     input_lengths= input_lengths.to(device)
@@ -206,7 +206,7 @@ def train_step_premerged(model:WrappedLM, model_config, accelerator:Accelerator,
         # gold_flat = shift_labels[shift_label_mask]               # [N_tokens]
         # logits_flat = shift_logits[shift_label_mask]         # [N_tokens, V]
 
-        kd_loss, ce_loss = compute_loss_premerged_with_ce(model=model,model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, cand_tokens_batch=cand_tokens_batch, logw_batch=logw_batch, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True)
+        kd_loss, ce_loss = compute_loss_premerged_with_ce(model=model,model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, cand_tokens=cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=0.5)
 
         loss = kd_loss*KL_WEIGHT + ce_loss * ALPHA_CE
         #loss = ce_loss
@@ -557,9 +557,10 @@ def process_ds():
 
 def main():
     train_ds = datasets.load_from_disk('/data_external/InfoSeek/train_gen_combined').with_format('torch')
-    train_distill = datasets.load_from_disk('/data_external/InfoSeek/distill_train').with_format('torch')
+    train_distill = datasets.load_from_disk('/data_external/InfoSeek/distill_pos').with_format('torch')
+    #distill_pos = train_distill.filter(lambda x: x['keep'] == True)
     train_ds = train_ds.remove_columns(["per_ev_top_ids", "per_ev_top_logps", "per_ev_tail"])
-    train_ds_ids = train_ds['data_id']
+    #train_ds_ids = train_ds['data_id']
     #train_ds_id_map = {e: i for i,e in tqdm(enumerate(train_ds_ids), total=len(train_ds_ids))}
     train_ds_id_map = torch.load('/data_external/InfoSeek/train_ds_id_map.pt')
 
@@ -623,7 +624,7 @@ def main():
         # teacher_tails = row['per_ev_tail']
         # ret_scores = row['scores']
         #return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores, row['answer_eval'], row['data_id']
-        return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, row['answer_eval'], row['data_id'], distill_row['merged_candidate_ids'], distill_row['merged_logw']
+        return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, row['answer_eval'], row['data_id'], distill_row['cand_tokens'], distill_row['ret_scores'], distill_row['sum_cand_logps'], distill_row['candidate_mask']
 
     def collate_eval(batch):
         row = {k: [e[k] for e in batch] for k in batch[0].keys()}
@@ -770,9 +771,9 @@ def main():
         pbar = tqdm(train_dl)
         for step, batch in enumerate(train_dl):
             #inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores = batch
-            inputs, input_lengths, answer_ids, answer_mask, answer_lengths, answer_eval, data_id, merged_candidate_ids, merged_logw = batch
+            inputs, input_lengths, answer_ids, answer_mask, answer_lengths, answer_eval, data_id, cand_tokens, ret_scores, sum_cand_logps, candidate_mask = batch
             #stats = train_step(model,unw_model.config, accel, processor, optimizer,scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  teacher_ids, teacher_logps, teacher_tails, ret_scores)
-            stats = train_step_premerged(model,unw_model.config, accel, processor, optimizer,scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  merged_candidate_ids, merged_logw)
+            stats = train_step_temperature(model,unw_model.config, accel, processor, optimizer,scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  cand_tokens, ret_scores, sum_cand_logps, candidate_mask)
             
             acc_loss.append(stats['loss'])
             cur_loss = np.mean(acc_loss)
@@ -850,5 +851,5 @@ def set_determinism(seed):
 
 if __name__ == "__main__":
     set_determinism(2026)
-    #main()
-    process_ds()
+    main()
+    #process_ds()

@@ -1294,6 +1294,104 @@ def compute_seqkd_or_mml_loss(
         return loss_vec.mean()
     raise ValueError(f"Unknown reduction: {reduction}")
 
+def merge_candidates_with_temperature(
+    cand_tokens: torch.Tensor,              # [K, L]
+    retrieval_sims_raw: torch.Tensor,       # [K]
+    teacher_conf_raw: Optional[torch.Tensor],  # [K] or None
+    candidate_mask: torch.Tensor,           # [K] bool
+    pad_id: int,
+    eos_id: Optional[int],
+    *,
+    tau_retrieval: float = 1.0,
+    tau_teacher: float = 1.0,
+    top_k: Optional[int] = None,
+    include_eos: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Per-example merge function.
+
+    Steps:
+      1) recompute unnormalized score under current temperatures
+      2) optional top-k on that score
+      3) merge duplicate answer sequences with logaddexp
+      4) normalize to logw
+
+    Returns:
+      merged_tokens: [K_uniq, L]
+      logw:          [K_uniq]   (normalized log-weights)
+      merged_score:  [K_uniq]   (unnormalized merged scores, useful for debugging / re-normalization)
+    """
+    device = cand_tokens.device
+    dtype = retrieval_sims_raw.dtype
+    K, L = cand_tokens.shape
+
+    candidate_mask = candidate_mask.to(device=device, dtype=torch.bool)
+
+    # 1) recompute unnormalized score under current temperatures
+    score = retrieval_sims_raw.to(device=device, dtype=dtype) / float(tau_retrieval)
+    if teacher_conf_raw is not None:
+        score = score + teacher_conf_raw.to(device=device, dtype=dtype) / float(tau_teacher)
+
+    score = score.masked_fill(~candidate_mask, float("-inf"))
+
+    # 2) optional top-k BEFORE merging/normalization
+    valid_idx = torch.nonzero(torch.isfinite(score), as_tuple=False).squeeze(-1)
+    if valid_idx.numel() == 0:
+        return (
+            torch.full((0, L), pad_id, device=device, dtype=cand_tokens.dtype),
+            torch.empty((0,), device=device, dtype=dtype),
+            torch.empty((0,), device=device, dtype=dtype),
+        )
+
+    if top_k is not None and valid_idx.numel() > top_k:
+        topk_local = torch.topk(score[valid_idx], k=top_k, dim=0, largest=True, sorted=False).indices
+        keep_idx = valid_idx[topk_local]
+    else:
+        keep_idx = valid_idx
+
+    kept_tokens = cand_tokens[keep_idx]   # [K_keep, L]
+    kept_score = score[keep_idx]          # [K_keep]
+
+    # 3) merge duplicates with logaddexp on UNNORMALIZED scores
+    seq_mask = token_mask_right_padded(
+        kept_tokens,
+        pad_id=pad_id,
+        eos_id=eos_id,
+        include_eos=include_eos,
+    )  # [K_keep, L] bool
+
+    merged_map: Dict[Tuple[int, ...], Tuple[torch.Tensor, torch.Tensor]] = {}
+    # value = (merged_score, representative_padded_tokens)
+
+    for i in range(kept_tokens.shape[0]):
+        seq_i = kept_tokens[i]
+        mask_i = seq_mask[i]
+        seq_trim = seq_i[mask_i]
+        key = tuple(seq_trim.tolist())
+
+        if key not in merged_map:
+            rep = torch.full((L,), pad_id, device=device, dtype=cand_tokens.dtype)
+            if seq_trim.numel() > 0:
+                rep[: seq_trim.numel()] = seq_trim
+            merged_map[key] = (kept_score[i], rep)
+        else:
+            prev_score, rep = merged_map[key]
+            merged_map[key] = (torch.logaddexp(prev_score, kept_score[i]), rep)
+
+    K_uniq = len(merged_map)
+    merged_tokens = torch.full((K_uniq, L), pad_id, device=device, dtype=cand_tokens.dtype)
+    merged_score = torch.empty((K_uniq,), device=device, dtype=dtype)
+
+    for j, (_, (s, rep)) in enumerate(merged_map.items()):
+        merged_tokens[j] = rep
+        merged_score[j] = s
+
+    # 4) normalize after top-k + merge
+    logZ = torch.logsumexp(merged_score, dim=0)
+    logw = merged_score - logZ
+
+    return merged_tokens, logw, merged_score
+
 def compute_loss_premerged_with_ce(
     *,
     model: torch.nn.Module,
@@ -1301,8 +1399,7 @@ def compute_loss_premerged_with_ce(
     prompt_inputs: Dict[str, torch.Tensor],                    # BatchFeature-like dict, tensors with batch dim [B, ...]
     label_mask:torch.Tensor,
     answer_ids,
-    cand_tokens_batch,
-    logw_batch,
+    cand_tokens, ret_scores, sum_cand_logps, candidate_mask,
     pad_id: int,
     eos_id: Optional[int],
     mode: Literal["seqkd", "mml"] = "mml",
@@ -1310,6 +1407,7 @@ def compute_loss_premerged_with_ce(
     # weighting hyperparameters
     tau_retrieval: float = 1.0,
     tau_teacher: float = 1.0,
+    top_k=10,
     teacher_confidence: Literal["none", "sum", "mean"] = "sum",
     include_eos_in_teacher_conf: bool = True,
     # student scoring
@@ -1342,6 +1440,18 @@ def compute_loss_premerged_with_ce(
     prompt_attention_mask = build_prompt_only_masks(model.device, prompt_inputs["input_ids"], prompt_inputs["attention_mask"], label_mask, pad_id=pad_id)
     #full_attn_mask = prompt_inputs['attention_mask']
     prompt_inputs['attention_mask'] = prompt_attention_mask
+
+    cand_tokens_batch, logw_batch, merged_score = merge_candidates_with_temperature(
+        cand_tokens=cand_tokens,
+        retrieval_sims_raw=ret_scores,
+        teacher_conf_raw=sum_cand_logps,
+        candidate_mask=candidate_mask,
+        pad_id=pad_id,
+        eos_id=eos_id,
+        tau_retrieval=tau_retrieval,
+        tau_teacher=tau_teacher,
+        top_k=20
+    )
     assert len(cand_tokens_batch) == B
     assert len(logw_batch) == B
 
