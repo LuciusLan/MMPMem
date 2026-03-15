@@ -1,4 +1,13 @@
 import argparse
+
+p = argparse.ArgumentParser()
+p.add_argument("--ret_tau", type=float,  default=1.)
+p.add_argument("--top_k", type=int, default=20)
+p.add_argument("--ce_weight", type=float, default=1.)
+p.add_argument("--kd_weight", type=float, default=0.5)
+p.add_argument("--lr", type=float, default=5e-5)
+args = p.parse_args()
+
 import os
 os.environ['HF_HOME'] = '/data_external/hf_cache'
 os.environ['CUDA_VISIBLE_DEVICES']="0,1"
@@ -16,6 +25,7 @@ import json
 import math
 import random
 from dataclasses import dataclass
+import time
 
 import numpy as np
 #import pandas as pd
@@ -44,15 +54,14 @@ from seq_kd_utils import compute_seqkd_or_mml_loss, extract_top1_sequences_and_l
 # ---------------------------
 # Hyperparameters & utilities
 # ---------------------------
-TEMPERATURE = 1.5         # softmax temperature for teacher
-ALPHA_CE = 1.0            # weight for gold CE
+ALPHA_CE = args.ce_weight            # weight for gold CE
 BETA_DELTA = 0.5          # weight for delta residual distillation (optional)
-KL_WEIGHT = 0.3           # weight for teacher KL
+KL_WEIGHT = args.kd_weight          # weight for teacher KL
 USE_RESIDUAL = False       # if True: memory learns residual logits; else memory outputs a dist directly
 HID_LAYER_ID = 32
 EPS = 1e-12
 MACRO_BATCH_SIZE = 20
-LR = 1e-5
+LR = args.lr
 
 # =========================
 # Optional: example train step wrapper
@@ -175,7 +184,7 @@ def train_step(model:WrappedLM, model_config, accelerator:Accelerator, processor
         }
     return stats
 
-def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerator, processor, optimizer,scheduler, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, cand_tokens, ret_scores, sum_cand_logps, candidate_mask):
+def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerator, processor, optimizer,scheduler, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, batch_cand_tokens, ret_scores, sum_cand_logps, candidate_mask):
     optimizer.zero_grad(set_to_none=True)
     base_inputs = {k :v.to(device) for k,v in base_inputs.items()}
     input_lengths= input_lengths.to(device)
@@ -206,7 +215,7 @@ def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerato
         # gold_flat = shift_labels[shift_label_mask]               # [N_tokens]
         # logits_flat = shift_logits[shift_label_mask]         # [N_tokens, V]
 
-        kd_loss, ce_loss = compute_loss_premerged_with_ce(model=model,model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, cand_tokens=cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=0.5)
+        kd_loss, ce_loss = model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train")
 
         loss = kd_loss*KL_WEIGHT + ce_loss * ALPHA_CE
         #loss = ce_loss
@@ -219,8 +228,8 @@ def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerato
     with torch.no_grad():
         stats = {
             "loss": float(loss.item()),
-            #"kl": float(kd_loss.item()),
-            "kl": 0.,
+            "kl": float(kd_loss.item()),
+            #"kl": 0.,
             "ce": float(ce_loss.item()),
             #"delta": float(delta_loss.item()) if BETA_DELTA > 0 else 0.0,
             #"eta": float(eta.sigmoid().item()) if not USE_RESIDUAL else float(eta.item()),
@@ -580,8 +589,11 @@ def main():
     for p in memory.parameters():
         p.requires_grad_(True)
 
-    saved_dict = torch.load('/data_external/MMPMem/checkpoints/step6000_ce_kd.pt')
-    memory.load_state_dict(saved_dict, strict=True)
+    print(next(memory.parameters()).device)
+    print(sum(p.numel() for p in memory.parameters()) / 1e9, "B params")
+
+    # saved_dict = torch.load('/data_external/MMPMem/checkpoints/step6000_ce_kd.pt')
+    # memory.load_state_dict(saved_dict, strict=True)
 
     model = WrappedLM(base_model, memory, config=base_model.config, processor=processor, layer_idx_for_mem=HID_LAYER_ID)
 
@@ -633,7 +645,7 @@ def main():
         base_inputs = process_input_test(processor, question, qimg).to(model.device)
         return base_inputs, row['answer_eval']
 
-    train_dl = DataLoader(train_distill, batch_size=1, shuffle=True, collate_fn=collate_train) #, num_workers=6, prefetch_factor=2,)
+    train_dl = DataLoader(train_distill, batch_size=MACRO_BATCH_SIZE, shuffle=True, collate_fn=collate_train, num_workers=5, prefetch_factor=2,)
     
     #train_dl = DataLoader(train_ds, batch_size=1, shuffle=True, collate_fn=collate_train_raw)
     # import re
@@ -672,28 +684,24 @@ def main():
     
     num_warmup_steps = 200
     num_training_steps = len(train_dl)*20
-    def lr_lambda(step: int, m_start=1e-7, m_min=1e-6) -> float:
-        # Clamp step to [0, num_training_steps] for safety
-        step = min(max(step, 0), num_training_steps)
-
+    def lr_lambda(step: int) -> float:
         if step < num_warmup_steps:
-            # Linear warmup from m_start -> 1.0
-            if num_warmup_steps == 0:
-                return 1.0
-            return m_start + (1.0 - m_start) * (step / num_warmup_steps)
+            return float(step) / float(max(1, num_warmup_steps))
 
-        # Cosine decay from 1.0 -> m_min
-        denom = max(1, num_training_steps - num_warmup_steps)
-        progress = (step - num_warmup_steps) / denom  # in [0,1]
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1 -> 0
-        return m_min + (1.0 - m_min) * cosine
+        progress = float(step - num_warmup_steps) / float(
+            max(1, num_training_steps - num_warmup_steps)
+        )
+        return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    
     optimizer = torch.optim.AdamW(list(memory.parameters()), lr=LR)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
     from accelerate.utils import DistributedDataParallelKwargs
     ddp = DistributedDataParallelKwargs(
-        broadcast_buffers=False        # critical
+        broadcast_buffers=True,
+        find_unused_parameters=True,
+        static_graph=False,
     )
     accel = Accelerator(kwargs_handlers=[ddp])
     model, optimizer,scheduler, train_dl, test_dl = accel.prepare(model, optimizer, scheduler, train_dl, test_dl)
@@ -701,31 +709,34 @@ def main():
     unw_model = accel.unwrap_model(model)
     _memory = unw_model.memory
     
-    #if accel.is_main_process:
-    #    wandb_run = wandb.init(project="MMMem", name="CEKD")
+    if accel.is_main_process:
+       wandb_run = wandb.init(project="MMMem", name="CEKD")
 
-    # model.eval()
-    # correct = torch.tensor(0., device=model.device)
-    # #cb = torch.tensor(0., device=model.device)
-    # all_gt = []
-    # all_pred =  []
-    # all_pred_base = []
-    # for row in tqdm(test_dl):
-    #     inputs, gts = row
-    #     with torch.inference_mode():
-    #         output_ids = unw_model.generate(**inputs, mix_mode='base')
-    #         input_len = inputs.input_ids.size(1)
-    #         generated_ids = output_ids[:, input_len:]
-    #         text = processor.batch_decode(generated_ids, skip_special_tokens=True)
+    accel.wait_for_everyone()
+    model.eval()
+    correct = torch.tensor(0., device=model.device)
+    #cb = torch.tensor(0., device=model.device)
+    all_gt = []
+    all_pred =  []
+    all_pred_base = []
+    with torch.inference_mode(), accel.join_uneven_inputs([model], even_batches=False):
+        for row in tqdm(test_dl):
+            inputs, gts = row
+            output_ids = unw_model.generate(**inputs, mix_mode='base', branch="generation")
+            input_len = inputs.input_ids.size(1)
+            generated_ids = output_ids[:, input_len:]
+            text = processor.batch_decode(generated_ids, skip_special_tokens=True)
 
-    #     for gt, pred in zip(gts, text):
-    #         if '{' in gt[0] and '}' in gt[0]:
-    #             gt = ast.literal_eval(gt[0])
-    #         score_m = score_infoseek(pred, gt)
-    #         correct += score_m['acc']
-    #         all_gt.append(gt)
-    #         all_pred.append(pred)
+            for gt, pred in zip(gts, text):
+                if '{' in gt[0] and '}' in gt[0]:
+                    gt = ast.literal_eval(gt[0])
+                score_m = score_infoseek(pred, gt)
+                correct += score_m['acc']
+                all_gt.append(gt)
+                all_pred.append(pred)
     
+
+    accel.wait_for_everyone()
     # if accel.is_main_process:
     #     correct = accel.reduce(correct, reduction="sum").item()
     #     wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
@@ -736,22 +747,6 @@ def main():
     # 1000 14.4
     # 3000 16.0
     # 6000 16.1
-
-    #pbar = tqdm(train_ds)
-
-    # from datasets import Features, Sequence, Value 
-    # features = Features({
-    #     "data_id": Value("string"),
-    #     "merged_candidate_ids": Sequence(Sequence(Value("int64"))),
-    #     "merged_logw": Sequence(Value("float32")),
-    #     "m_first_tok_id": Sequence(Value("int64")),
-    #     "m_first_tok_logp": Sequence(Value("float32")),
-    #     "m_first_tok_tail": Value("float32"),
-    #     "candidate_has_correct": Value("bool")
-    # })
-
-    # distil_dataset = HFDataset.from_generator(gen, features=features, gen_kwargs={'input_ds': train_ds, 'processor':processor, 'device': model.device})
-    # distil_dataset.save_to_disk('/data_external/InfoSeek/distill_train')
     #         # Top 30:
     #         # 4706/10000 has GT answer in candidates
     #         # average marginalized weight for GT answer in candidates: 45.54%
@@ -765,8 +760,8 @@ def main():
     #         # average rank of GT answer appearing in candidates: 1.66
     #         # avg candidate num: 4.08
 
-    for ep in range(20):
-        unw_model.train()
+    for ep in range(5):
+        model.train()
         acc_loss = []
         pbar = tqdm(train_dl)
         for step, batch in enumerate(train_dl):
@@ -786,18 +781,45 @@ def main():
                     "train/step": ep * len(train_dl) + step,
                     "train/loss": stats['loss'],
                     "train/ce_loss": stats['ce'],
-                    "train/kl_loss": stats['kl'],
+                    "train/kd_loss": stats['kl'],
                     "train/current_lr": scheduler.get_last_lr()[0],
                 }
                 wandb_run.log(log_dict)
             if step%20 == 0:
                 torch.cuda.empty_cache()
 
-            if step%2000 == 0:
+            if step%2000 == 0 and step != 0:
                 accel.wait_for_everyone()
                 state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
                 if accel.is_main_process:
-                    torch.save(state, f"/data_external/MMPMem/checkpoints/step{step}_ce_kd.pt")
+                    torch.save(state, f"/data_external/MMPMem/checkpoints/ep{ep}step{step}_ce_kd.pt")
+
+                accel.wait_for_everyone()
+                model.eval()
+                correct =torch.tensor(0., device=model.device)
+                em = 0
+                cb = torch.tensor(0., device=model.device)
+                eb = 0
+                for row in tqdm(test_dl):
+                    inputs, gts = row
+                    with torch.inference_mode():
+                        output_ids = unw_model.generate(**inputs, mix_mode='mix', branch='generation')
+                        input_len = inputs.input_ids.size(1)
+                        generated_ids = output_ids[:, input_len:]
+                        text = processor.batch_decode(generated_ids, skip_special_tokens=True)
+
+                    for gt, pred in zip(gts, text):
+                        if '{' in gt[0] and '}' in gt[0]:
+                            gt = ast.literal_eval(gt[0])
+                        score_m = score_infoseek(pred, gt)
+                        correct += score_m['acc']
+                model.train()
+                print(f"Ep {ep}: val acc: {correct/1000} | val em: {em/1000}")
+                accel.wait_for_everyone()
+                correct = accel.reduce(correct, reduction="sum").item()
+                #cb = accel.reduce(cb, reduction="sum").item()
+                if accel.is_main_process:
+                    wandb_run.log({'eval/acc': correct/1000})
 
         accel.wait_for_everyone()
         state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
@@ -807,7 +829,7 @@ def main():
 
         # saved_dict = torch.load('/data_external/MMPMem/checkpoints/0_ce_only.pt')
         # memory.load_state_dict(saved_dict, strict=True)
-        unw_model.eval()
+        model.eval()
         correct =torch.tensor(0., device=model.device)
         em = 0
         cb = torch.tensor(0., device=model.device)
@@ -815,7 +837,7 @@ def main():
         for row in tqdm(test_dl):
             inputs, gts = row
             with torch.inference_mode():
-                output_ids = unw_model.generate(**inputs, mix_mode='mix')
+                output_ids = unw_model.generate(**inputs, mix_mode='mix', branch="generation")
                 input_len = inputs.input_ids.size(1)
                 generated_ids = output_ids[:, input_len:]
                 text = processor.batch_decode(generated_ids, skip_special_tokens=True)

@@ -107,11 +107,11 @@ def _repeat_dynamic_cache(base_cache: Union[Any,DynamicCache], repeat: int) -> A
     if DynamicCache is None:
         raise RuntimeError("DynamicCache is not available; install a recent transformers version.")
 
-    #new_cache = copy.deepcopy(base_cache)
-    base_cache.batch_repeat_interleave(repeat)
+    new_cache = copy.deepcopy(base_cache)
+    new_cache.batch_repeat_interleave(repeat)
     #new_cache = None
 
-    return base_cache
+    return new_cache
 
 def _get_qwen3vl_image_nums_from_input_ids(
     input_ids: torch.Tensor,
@@ -872,7 +872,8 @@ def mml_loss_from_seq_logp(
     if candidate_mask is None:
         candidate_mask = torch.isfinite(logw)
     else:
-        candidate_mask = candidate_mask.to(dtype=torch.bool)
+        pass
+        #candidate_mask = candidate_mask.to(dtype=torch.bool)
 
     lw = logw.masked_fill(~candidate_mask, float("-inf"))
 
@@ -1030,8 +1031,6 @@ def compute_student_seq_logp_qwen3vl(
     logp_first_dist = F.log_softmax(prompt_logits_last, dim=-1)  # [1, V]
     prompt_position_ids = out_prompt.position_ids
 
-
-    cand_tokens = trim_excess_right_padding(cand_tokens, pad_id)
     mask_all = token_mask_right_padded(
         cand_tokens,
         pad_id=pad_id,
@@ -1399,7 +1398,7 @@ def compute_loss_premerged_with_ce(
     prompt_inputs: Dict[str, torch.Tensor],                    # BatchFeature-like dict, tensors with batch dim [B, ...]
     label_mask:torch.Tensor,
     answer_ids,
-    cand_tokens, ret_scores, sum_cand_logps, candidate_mask,
+    batch_cand_tokens, ret_scores, sum_cand_logps, candidate_mask,
     pad_id: int,
     eos_id: Optional[int],
     mode: Literal["seqkd", "mml"] = "mml",
@@ -1441,33 +1440,39 @@ def compute_loss_premerged_with_ce(
     #full_attn_mask = prompt_inputs['attention_mask']
     prompt_inputs['attention_mask'] = prompt_attention_mask
 
-    cand_tokens_batch, logw_batch, merged_score = merge_candidates_with_temperature(
-        cand_tokens=cand_tokens,
-        retrieval_sims_raw=ret_scores,
-        teacher_conf_raw=sum_cand_logps,
-        candidate_mask=candidate_mask,
-        pad_id=pad_id,
-        eos_id=eos_id,
-        tau_retrieval=tau_retrieval,
-        tau_teacher=tau_teacher,
-        top_k=20
-    )
-    assert len(cand_tokens_batch) == B
-    assert len(logw_batch) == B
+
+    assert len(batch_cand_tokens) == B
+    assert len(sum_cand_logps) == B
 
     # Extract top-1 realized sequences (index 0) per example
     kd_losses: List[torch.Tensor] = []
     ce_losses: List[torch.Tensor] = []
 
     for b in range(B):
-        cand_tokens = cand_tokens_batch[b]
-        logw = logw_batch[b]
-        candidate_mask = None
+        sample_cand_token = batch_cand_tokens[b]
+        sample_ret_score = ret_scores[b]
+        sample_candidate_mask = candidate_mask[b]
+        sample_teacher_conf = sum_cand_logps[b]
+
+        cand_tokens, logw, merged_score = merge_candidates_with_temperature(
+            cand_tokens=sample_cand_token,
+            retrieval_sims_raw=sample_ret_score,
+            teacher_conf_raw=sample_teacher_conf,
+            candidate_mask=sample_candidate_mask,
+            pad_id=pad_id,
+            eos_id=eos_id,
+            tau_retrieval=tau_retrieval,
+            tau_teacher=tau_teacher,
+            top_k=top_k
+        )
+        #candidate_mask = None
         if len(cand_tokens) == 0:
             kd_losses.append(prompt_inputs["input_ids"].new_zeros((), dtype=torch.float32))
             ce_losses.append(prompt_inputs["input_ids"].new_zeros((), dtype=torch.float32))
             print("Empty candidate batch")
             continue
+
+        cand_tokens = trim_excess_right_padding(cand_tokens, pad_id)
 
         # Student conditioned on ORIGINAL image+question for sample b
         student_seq_logp, prompt_cache_return, logp_first_dist, prompt_position_ids = compute_student_seq_logp_qwen3vl(
