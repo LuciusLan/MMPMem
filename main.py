@@ -5,7 +5,7 @@ p.add_argument("--ret_tau", type=float,  default=1.)
 p.add_argument("--top_k", type=int, default=20)
 p.add_argument("--ce_weight", type=float, default=1.)
 p.add_argument("--kd_weight", type=float, default=0.5)
-p.add_argument("--lr", type=float, default=5e-5)
+p.add_argument("--lr", type=float, default=4e-6)
 args = p.parse_args()
 
 import os
@@ -577,7 +577,7 @@ def main():
     #train_ds = train_ds.select(range(100000))
     test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_combined').with_format('torch')
 
-    base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16, device_map='cuda')
+    base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
 
     # #base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="eager", dtype=torch.float16, device_map='cpu')
 
@@ -737,9 +737,11 @@ def main():
     
 
     accel.wait_for_everyone()
-    # if accel.is_main_process:
-    #     correct = accel.reduce(correct, reduction="sum").item()
-    #     wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
+    correct = accel.reduce(correct, reduction="sum")
+    if accel.is_main_process:
+        correct = correct.item()
+        print(correct)
+        wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
     accel.wait_for_everyone()
     # 14.90
     #base 22.4
@@ -768,7 +770,7 @@ def main():
             #inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores = batch
             inputs, input_lengths, answer_ids, answer_mask, answer_lengths, answer_eval, data_id, cand_tokens, ret_scores, sum_cand_logps, candidate_mask = batch
             #stats = train_step(model,unw_model.config, accel, processor, optimizer,scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  teacher_ids, teacher_logps, teacher_tails, ret_scores)
-            stats = train_step_temperature(model,unw_model.config, accel, processor, optimizer,scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  cand_tokens, ret_scores, sum_cand_logps, candidate_mask)
+            stats = train_step_temperature(model,unw_model.config, accel, processor, optimizer, scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  cand_tokens, ret_scores, sum_cand_logps, candidate_mask)
             
             acc_loss.append(stats['loss'])
             cur_loss = np.mean(acc_loss)
