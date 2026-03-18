@@ -5,7 +5,7 @@ p.add_argument("--ret_tau", type=float,  default=1.)
 p.add_argument("--top_k", type=int, default=20)
 p.add_argument("--ce_weight", type=float, default=1.)
 p.add_argument("--kd_weight", type=float, default=0.5)
-p.add_argument("--lr", type=float, default=4e-6)
+p.add_argument("--lr", type=float, default=5e-6)
 args = p.parse_args()
 
 import os
@@ -323,8 +323,8 @@ def get_stats_step(model:WrappedLM, processor, device, base_inputs: BatchFeature
         return cand_tokens,retrieval_sims_raw, teacher_conf_raw,candidate_mask, first_ids_list, first_logp_list, first_tail_list, gt_is_ranked_top, gt_rank, top_weight
 
 
-prompt_base = "Answer the image related question. For many fact checking questions, the desired answer would be named entities instead of common concept, for example \"Mount Everest\" instead of \"mountain top\", \"River Thames\" instead of \"river\". Be concise, output the answer only, without any additional words."
-prompt_teacher = "Answer the image related question. For many fact checking questions, the desired answer would be named entities instead of common concept, for example \"Mount Everest\" instead of \"mountain top\", \"River Thames\" instead of \"river\". Be concise, output the answer only, without any additional words. An additional image is provided for your reference, but it is not guaranteed to be relevant to original question."
+prompt_base = "Answer the image related question. For fact checking questions, the desired answer would be named entities instead of common concept, for example \"Mount Everest\" instead of \"mountain top\", \"River Thames\" instead of \"river\". Be concise, output the answer only, without any additional words."
+prompt_teacher = "Answer the image related question. For fact checking questions, the desired answer would be named entities instead of common concept, for example \"Mount Everest\" instead of \"mountain top\", \"River Thames\" instead of \"river\". Be concise, output the answer only, without any additional words. An additional image is provided for your reference, but it is not guaranteed to be relevant to original question."
 
 def process_input_test(processor, question_batch, qimg_batch, ret_image=None):
     messages = []
@@ -679,11 +679,11 @@ def main():
     #     stats.append([has_correct, rank])
     #     pass
     #train_dl.__iter__().__next__()
-    test_dl = DataLoader(test_ds, batch_size=MACRO_BATCH_SIZE, collate_fn=collate_eval)
+    test_dl = DataLoader(test_ds, batch_size=1, collate_fn=collate_eval)
 
     
     num_warmup_steps = 200
-    num_training_steps = len(train_dl)*20
+    num_training_steps = len(train_dl)*4
     def lr_lambda(step: int) -> float:
         if step < num_warmup_steps:
             return float(step) / float(max(1, num_warmup_steps))

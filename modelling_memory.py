@@ -143,7 +143,11 @@ class WrappedLM(nn.Module, GenerationMixin):
 
         # add your custom state
         if getattr(outputs, "position_ids", None) is not None:
-            model_kwargs["position_ids"] = outputs.position_ids
+            #model_kwargs["position_ids"] = outputs.position_ids
+            next_position_id =  outputs.position_ids.clone()
+            next_position_id = next_position_id[:,:,-1] +1
+            next_position_id = next_position_id.unsqueeze(1)
+            model_kwargs["position_ids"] = next_position_id
 
         return model_kwargs
     
@@ -582,7 +586,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         batch_cand_tokens, ret_scores, sum_cand_logps, candidate_mask,
         pad_id: int,
         eos_id: Optional[int],
-        mode: Literal["seqkd", "mml"] = "mml",
+        mode: Literal["seqkd", "mml"] = "seqkd",
         merge_duplicates: bool = True,
         # weighting hyperparameters
         tau_retrieval: float = 1.0,
@@ -753,7 +757,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         branch=None,
         **kwargs: Unpack[TransformersKwargs],):
         if branch == "generation":
-            if position_ids.size(0) != 4:
+            if position_ids.size(0) != 4 or len(position_ids.shape) != 3:
                 position_ids = None
             out = self.forward_basic(
                 input_ids=input_ids,
