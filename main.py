@@ -5,11 +5,11 @@ p.add_argument("--ret_tau", type=float,  default=1.)
 p.add_argument("--top_k", type=int, default=20)
 p.add_argument("--ce_weight", type=float, default=1.)
 p.add_argument("--kd_weight", type=float, default=0.5)
-p.add_argument("--lr", type=float, default=5e-6)
+p.add_argument("--lr", type=float, default=1e-5)
 args = p.parse_args()
 
 import os
-os.environ['HF_HOME'] = '/data_external/hf_cache'
+#os.environ['HF_HOME'] = '/data_external/hf_cache'
 os.environ['CUDA_VISIBLE_DEVICES']="0,1"
 os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
 os.environ['HF_HUB_OFFLINE'] = "1" 
@@ -565,25 +565,27 @@ def process_ds():
     return
 
 def main():
-    train_ds = datasets.load_from_disk('/data_external/InfoSeek/train_gen_combined').with_format('torch')
-    train_distill = datasets.load_from_disk('/data_external/InfoSeek/distill_pos').with_format('torch')
+    train_ds = datasets.load_from_disk('/data_external/video/datasets/MPM/train_gen_combined').with_format('torch')
+    train_distill = datasets.load_from_disk('/data_external/video/datasets/MPM/distill_pos').with_format('torch')
     #distill_pos = train_distill.filter(lambda x: x['keep'] == True)
-    train_ds = train_ds.remove_columns(["per_ev_top_ids", "per_ev_top_logps", "per_ev_tail"])
+    #distill_pos.save_to_disk('/data_external/video/datasets/MPM/distill_pos')
+    #train_ds = train_ds.remove_columns(["per_ev_top_ids", "per_ev_top_logps", "per_ev_tail"])
     #train_ds_ids = train_ds['data_id']
     #train_ds_id_map = {e: i for i,e in tqdm(enumerate(train_ds_ids), total=len(train_ds_ids))}
+    #torch.save(train_ds_id_map, '/data_external/video/datasets/MPM/train_ds_id_map.pt')
     train_ds_id_map = torch.load('/data_external/InfoSeek/train_ds_id_map.pt')
 
     #train_ds = train_ds.cast_column("image", HFImage(decode=True))
     #train_ds = train_ds.select(range(100000))
-    test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_combined').with_format('torch')
+    test_ds = datasets.load_from_disk('/data_external/video/datasets/MPM/val_combined').with_format('torch')
 
-    base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
+    base_model = Qwen3VLForConditionalGeneration.from_pretrained("/data_external/video/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
 
     # #base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="eager", dtype=torch.float16, device_map='cpu')
 
     for p in base_model.parameters():
        p.requires_grad_(False)
-    processor = AutoProcessor.from_pretrained('/wyy/models/Qwen3-VL-8B-Instruct')
+    processor = AutoProcessor.from_pretrained('/data_external/video/models/Qwen3-VL-8B-Instruct')
 
     memory = MemoryMLP()
     for p in memory.parameters():
@@ -592,7 +594,7 @@ def main():
     print(next(memory.parameters()).device)
     print(sum(p.numel() for p in memory.parameters()) / 1e9, "B params")
 
-    # saved_dict = torch.load('/data_external/MMPMem/checkpoints/step6000_ce_kd.pt')
+    # saved_dict = torch.load('/data_external/video/codes/MPM/checkpoints/step6000_ce_kd.pt')
     # memory.load_state_dict(saved_dict, strict=True)
 
     model = WrappedLM(base_model, memory, config=base_model.config, processor=processor, layer_idx_for_mem=HID_LAYER_ID)
@@ -683,7 +685,7 @@ def main():
 
     
     num_warmup_steps = 200
-    num_training_steps = len(train_dl)*4
+    num_training_steps = len(train_dl)*3
     def lr_lambda(step: int) -> float:
         if step < num_warmup_steps:
             return float(step) / float(max(1, num_warmup_steps))
@@ -710,7 +712,7 @@ def main():
     _memory = unw_model.memory
     
     if accel.is_main_process:
-       wandb_run = wandb.init(project="MMMem", name="CEKD")
+       wandb_run = wandb.init(project="MMMem", name=f"CEKD_t{args.ret_tau}_k{args.top_k}_mml")
 
     accel.wait_for_everyone()
     model.eval()
@@ -794,7 +796,7 @@ def main():
                 accel.wait_for_everyone()
                 state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
                 if accel.is_main_process:
-                    torch.save(state, f"/data_external/MMPMem/checkpoints/ep{ep}step{step}_ce_kd.pt")
+                    torch.save(state, f"/data_external/video/codes/MPM/checkpoints/ep{ep}step{step}_ce_kd.pt")
 
                 accel.wait_for_everyone()
                 model.eval()
@@ -826,7 +828,7 @@ def main():
         accel.wait_for_everyone()
         state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
         if accel.is_main_process:
-            torch.save(state, f"/data_external/MMPMem/checkpoints/{ep}_ce_kd.pt")
+            torch.save(state, f"/data_external/video/codes/MPM/checkpoints/{ep}_ce_kd.pt")
         accel.wait_for_everyone()
 
         # saved_dict = torch.load('/data_external/MMPMem/checkpoints/0_ce_only.pt')
