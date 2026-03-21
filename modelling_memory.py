@@ -753,7 +753,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         detach_prompt_cache=True, 
         tau_retrieval=None, 
         top_k=None,
-
+        mode=None,
         branch=None,
         **kwargs: Unpack[TransformersKwargs],):
         if branch == "generation":
@@ -773,8 +773,10 @@ class WrappedLM(nn.Module, GenerationMixin):
                 mix_lambda=mix_lambda,
                 **kwargs,)
         elif branch == "train":
+            if mode == None:
+                mode = 'mml'
             out = self.compute_loss_premerged_with_ce(
-            model_config=model_config, prompt_inputs=prompt_inputs, label_mask=label_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, candidate_mask=candidate_mask, pad_id=self.pad_token_id, eos_id=self.eos_token_id, detach_prompt_cache=detach_prompt_cache, tau_retrieval=tau_retrieval, top_k=top_k, chunk_size=20
+            model_config=model_config, prompt_inputs=prompt_inputs, label_mask=label_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, candidate_mask=candidate_mask, pad_id=self.pad_token_id, eos_id=self.eos_token_id, detach_prompt_cache=detach_prompt_cache, tau_retrieval=tau_retrieval, top_k=top_k, chunk_size=20, mode=mode
         )
         
         return out

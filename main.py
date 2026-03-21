@@ -215,7 +215,7 @@ def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerato
         # gold_flat = shift_labels[shift_label_mask]               # [N_tokens]
         # logits_flat = shift_logits[shift_label_mask]         # [N_tokens, V]
 
-        kd_loss, ce_loss = model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train")
+        kd_loss, ce_loss = model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train", mode='mml')
 
         loss = kd_loss*KL_WEIGHT + ce_loss * ALPHA_CE
         #loss = ce_loss
@@ -567,13 +567,16 @@ def process_ds():
 def main():
     train_ds = datasets.load_from_disk('/data_external/video/datasets/MPM/train_gen_combined').with_format('torch')
     train_distill = datasets.load_from_disk('/data_external/video/datasets/MPM/distill_pos').with_format('torch')
-    #distill_pos = train_distill.filter(lambda x: x['keep'] == True)
+    #distill_pos = train_distill.filter(lambda x: x['keep'] == True and x['candidate_gt_rank']==0)
     #distill_pos.save_to_disk('/data_external/video/datasets/MPM/distill_pos')
+
+    #print(len(distill_pos))
+    #return
     #train_ds = train_ds.remove_columns(["per_ev_top_ids", "per_ev_top_logps", "per_ev_tail"])
-    #train_ds_ids = train_ds['data_id']
-    #train_ds_id_map = {e: i for i,e in tqdm(enumerate(train_ds_ids), total=len(train_ds_ids))}
-    #torch.save(train_ds_id_map, '/data_external/video/datasets/MPM/train_ds_id_map.pt')
-    train_ds_id_map = torch.load('/data_external/InfoSeek/train_ds_id_map.pt')
+    train_ds_ids = train_ds['data_id']
+    train_ds_id_map = {e: i for i,e in tqdm(enumerate(train_ds_ids), total=len(train_ds_ids))}
+    torch.save(train_ds_id_map, '/data_external/video/datasets/MPM/train_ds_id_map.pt')
+    #train_ds_id_map = torch.load('/data_external/video/datasets/MPM/train_ds_id_map.pt')
 
     #train_ds = train_ds.cast_column("image", HFImage(decode=True))
     #train_ds = train_ds.select(range(100000))
@@ -796,7 +799,7 @@ def main():
                 accel.wait_for_everyone()
                 state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
                 if accel.is_main_process:
-                    torch.save(state, f"/data_external/video/codes/MPM/checkpoints/ep{ep}step{step}_ce_kd.pt")
+                    torch.save(state, f"/data_external/video/code/MPM/checkpoints/ep{ep}step{step}_ce_kd.pt")
 
                 accel.wait_for_everyone()
                 model.eval()
@@ -828,7 +831,7 @@ def main():
         accel.wait_for_everyone()
         state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
         if accel.is_main_process:
-            torch.save(state, f"/data_external/video/codes/MPM/checkpoints/{ep}_ce_kd.pt")
+            torch.save(state, f"/data_external/video/code/MPM/checkpoints/{ep}_ce_kd.pt")
         accel.wait_for_everyone()
 
         # saved_dict = torch.load('/data_external/MMPMem/checkpoints/0_ce_only.pt')
