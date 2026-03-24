@@ -4,8 +4,8 @@ p = argparse.ArgumentParser()
 p.add_argument("--ret_tau", type=float,  default=1.)
 p.add_argument("--top_k", type=int, default=20)
 p.add_argument("--ce_weight", type=float, default=1.)
-p.add_argument("--kd_weight", type=float, default=0.5)
-p.add_argument("--lr", type=float, default=5e-6)
+p.add_argument("--kd_weight", type=float, default=0.4)
+p.add_argument("--lr", type=float, default=2e-6)
 args = p.parse_args()
 
 import os
@@ -21,6 +21,7 @@ from typing import List, Dict, Optional, Tuple, Literal, Callable, Any, Iterable
 from transformers.feature_extraction_utils import BatchFeature
 from glob import glob
 import ast
+import re
 import json
 import math
 import random
@@ -49,16 +50,17 @@ from accelerate.utils import tqdm
 from modelling_memory import MemoryMLP, WrappedLM
 from inference import generate_with_memory
 from eval_util import score_infoseek
-from seq_kd_utils import compute_seqkd_or_mml_loss, extract_top1_sequences_and_logp, merge_duplicate_candidates, compute_candidate_log_weights, marginalize_first_token_logp, compute_loss_premerged_with_ce, compute_candidate_log_weights_for_cache, label_candidate
+from seq_kd_utils import compute_seqkd_or_mml_loss, extract_top1_sequences_and_logp, compute_candidate_log_weights_for_cache, label_candidate
 
 # ---------------------------
 # Hyperparameters & utilities
 # ---------------------------
 ALPHA_CE = args.ce_weight            # weight for gold CE
 BETA_DELTA = 0.5          # weight for delta residual distillation (optional)
-KL_WEIGHT = args.kd_weight          # weight for teacher KL
+KD_WEIGHT = args.kd_weight          # weight for teacher KL
+KL_WEIGHT = 0.3
 USE_RESIDUAL = False       # if True: memory learns residual logits; else memory outputs a dist directly
-HID_LAYER_ID = 32
+HID_LAYER_ID = -1
 EPS = 1e-12
 MACRO_BATCH_SIZE = 20
 LR = args.lr
@@ -67,57 +69,7 @@ LR = args.lr
 # Optional: example train step wrapper
 # =========================
 
-def softmax_T(logits, T=1.0):
-    return F.softmax(logits / T, dim=-1)
 
-def kl_divergence(p_logit, q_logit, T=1.0, eps=1e-8):
-    # KL( p || q ); both inputs are logits
-    p = softmax_T(p_logit, T)
-    q = softmax_T(q_logit, T)
-    return torch.sum(p * (torch.log(p + eps) - torch.log(q + eps)), dim=-1)
-
-def sparse_kl_with_tail(
-    student_logits,   # [A, V] logits from base+memory at answer positions
-    teacher_ids_with,          # [A, M] teacher union token ids (=-1 means padding)
-    teacher_logprob_with,         # [A, M] teacher log-probs on union tokens
-    tail_logprob         # [A]    teacher log-prob for OTHER bucket
-):
-    eps = 1e-8
-
-    # log p_student over full vocab
-    # [B, A, V]
-    log_p_s = F.log_softmax(student_logits, dim=-1)
-
-    # teacher top-K probs (optionally renormalized with tail)
-    # [B, A, K]
-    p_t_topk = torch.exp(teacher_logprob_with)
-    p_t_tail = torch.exp(tail_logprob).unsqueeze(-1)  # [B, A, 1]
-
-    # Optional: renormalize (robust if teacher probs are not perfectly normalized)
-    mass_topk = p_t_topk.sum(-1, keepdim=True)        # [B, A, 1]
-    Z = (mass_topk + p_t_tail).clamp_min(eps)         # [B, A, 1]
-    p_t_topk = p_t_topk / Z
-    p_t_tail = p_t_tail / Z
-
-    log_p_t_topk = torch.log(p_t_topk + eps)          # [B, A, K]
-    log_p_t_tail = torch.log(p_t_tail + eps).squeeze(-1)  # [B, A]
-
-    # log p_student on teacher's top-K tokens
-    # teacher_ids_with: [B, A, K]
-    log_p_s_topk = log_p_s.gather(dim=-1, index=teacher_ids_with)  # [B, A, K]
-    p_s_topk     = torch.exp(log_p_s_topk)                         # [B, A, K]
-
-    # student tail mass = 1 - sum_{topK} p_s
-    p_s_topk_sum = p_s_topk.sum(-1)               # [B, A]
-    p_s_tail     = (1.0 - p_s_topk_sum).clamp_min(eps)   # [B, A]
-    log_p_s_tail = torch.log(p_s_tail)            # [B, A]
-
-    # KL = sum_i p_t(i) [log p_t(i)-log p_s(i)] + p_tail[log p_tail-log p_s_tail]
-    term_topk = (p_t_topk * (log_p_t_topk - log_p_s_topk)).sum(-1)  # [B, A]
-    term_tail = p_t_tail.squeeze(-1) * (log_p_t_tail - log_p_s_tail)  # [B, A]
-
-    kl = term_topk + term_tail    # [B, A]
-    return kl.mean()              # scalar
 
 # ---------------------------
 # Single-sample training step
@@ -184,7 +136,7 @@ def train_step(model:WrappedLM, model_config, accelerator:Accelerator, processor
         }
     return stats
 
-def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerator, processor, optimizer,scheduler, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, batch_cand_tokens, ret_scores, sum_cand_logps, candidate_mask):
+def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerator, processor, optimizer,scheduler, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, batch_cand_tokens, ret_scores, sum_cand_logps,m_first_tok_id, m_first_tok_logp, m_first_tok_tail, candidate_mask, mode="seqkd"):
     optimizer.zero_grad(set_to_none=True)
     base_inputs = {k :v.to(device) for k,v in base_inputs.items()}
     input_lengths= input_lengths.to(device)
@@ -215,9 +167,9 @@ def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerato
         # gold_flat = shift_labels[shift_label_mask]               # [N_tokens]
         # logits_flat = shift_logits[shift_label_mask]         # [N_tokens, V]
 
-        kd_loss, ce_loss = model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train")
+        kd_loss, ce_loss, ft_kl_loss = model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, m_first_tok_id=m_first_tok_id, m_first_tok_logp=m_first_tok_logp, m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train", mode=mode, add_kl=True)
 
-        loss = kd_loss*KL_WEIGHT + ce_loss * ALPHA_CE
+        loss = kd_loss*KD_WEIGHT + ce_loss * ALPHA_CE# + ft_kl_loss*KL_WEIGHT
         #loss = ce_loss
         accelerator.backward(loss)
         params_to_clip = [p for g in optimizer.param_groups for p in g["params"]]
@@ -236,8 +188,25 @@ def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerato
         }
     return stats
 
+_ABSTENTION_PATTERNS = [
+    r"\bi\s+don't\s+know\b",
+    r"\bi\s+do\s+not\s+know\b",
+    r"\bnot enough information\b",
+    r"\binsufficient information\b",
+    r"\bcannot be determined\b",
+    r"\bcan't be determined\b",
+    r"\bcannot answer\b",
+    r"\bcan't answer\b",
+    r"\bunable to answer\b",
+    r"\bthe (given|provided) (evidence|context|information) is not enough\b",
+    r"\bthere is no information\b",
+]
+def _contains_abstention(text: str, patterns: list[str]) -> bool:
+    text = text.strip().lower()
+    return any(re.search(p, text) is not None for p in patterns)
 
-def get_stats_step(model:WrappedLM, processor, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, teacher_ids:torch.Tensor, teacher_logprob:torch.Tensor, tail_logprob:torch.Tensor, ret_scores:torch.Tensor, gt:str, score_func, tokenizer):
+
+def get_stats_step(model:WrappedLM, processor, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, teacher_ids:torch.Tensor, teacher_logprob:torch.Tensor, tail_logprob:torch.Tensor, ret_scores:torch.Tensor, gt:str, score_func, tokenizer, tau=1.):
     base_inputs = {k :v.to(device) for k,v in base_inputs.items()}
     input_lengths= input_lengths.to(device)
     answer_ids = answer_ids.to(device)
@@ -248,13 +217,7 @@ def get_stats_step(model:WrappedLM, processor, device, base_inputs: BatchFeature
     ret_scores = [e.to(device)[:29] for e in ret_scores]
     tail_logprob = [e.to(device)[:29, :] for e in tail_logprob]
 
-    first_ids_list, first_logp_list, first_tail_list = marginalize_first_token_logp(
-        answer_ids_top32_list=teacher_ids,
-        answer_logp_top32_list=teacher_logprob,
-        tail_mass_list=tail_logprob,                 # optional
-        retrieval_sims_list=ret_scores,
-        normalize_candidate_weights=True,
-    )
+
     assert "input_ids" in base_inputs and "attention_mask" in base_inputs
     B = int(base_inputs["input_ids"].shape[0])
     #prompt_attention_mask = build_prompt_only_masks(model.device, prompt_inputs["input_ids"], prompt_inputs["attention_mask"], label_mask, pad_id=pad_id)
@@ -275,9 +238,23 @@ def get_stats_step(model:WrappedLM, processor, device, base_inputs: BatchFeature
 
         Kb = int(retrieval_sims.shape[0])
         if Kb == 0:
-            continue
+            return None
 
         candidate_mask = torch.isfinite(retrieval_sims)
+
+        cand_texts = processor.batch_decode(cand_tokens, skip_special_tokens=True)
+
+        counts_mask = (cand_tokens == 151643).sum(dim=1)
+        cand_length = cand_tokens.size(1) - counts_mask
+        has_abst = torch.tensor([_contains_abstention(e, _ABSTENTION_PATTERNS) for e in cand_texts], dtype=torch.bool)
+        too_long = cand_length > 30
+
+        invalid_cand = torch.logical_or(has_abst, too_long)
+        if invalid_cand.any():
+            ic = invalid_cand.tolist()
+            c = ic.count(True)
+            if c > Kb//2:
+                return None
 
         retrieval_sims_raw, teacher_conf_raw, combined_score, candidate_mask = compute_candidate_log_weights_for_cache(
             retrieval_sims=retrieval_sims.unsqueeze(0),                 # [1, K]
@@ -286,23 +263,28 @@ def get_stats_step(model:WrappedLM, processor, device, base_inputs: BatchFeature
             pad_id=151643,
             eos_id=151645,
             candidate_mask=candidate_mask.unsqueeze(0),
-            tau_retrieval=1.,
+            tau_retrieval=tau,
             tau_teacher=1.,
-            teacher_confidence="sum",
+            teacher_confidence="mean",
             include_eos_in_teacher_conf=True,
             return_components=True
         )  # [K]
 
-        gt_is_ranked_top, gt_rank, top_weight = label_candidate(
+        candidate_mask = ~invalid_cand
+        candidate_mask = candidate_mask.unsqueeze(0)
+
+        gt_is_ranked_top, gt_rank, top_weight, merged_scores = label_candidate(
             cand_tokens=cand_tokens,
             gt=gt,
-            retrieval_sims_raw=retrieval_sims_raw,
+            retrieval_sims_raw=ret_scores[b],
+            #teacher_conf_raw=None,
             teacher_conf_raw=teacher_conf_raw,
             candidate_mask=candidate_mask,
             pad_id=151643,
             eos_id=151645,
             score_func=score_func,
             tokenizer=tokenizer,
+            tau_retrieval=tau,
         )
         # logw = logw.squeeze(0)
         # log_alpha = log_alpha.squeeze(0)
@@ -320,7 +302,11 @@ def get_stats_step(model:WrappedLM, processor, device, base_inputs: BatchFeature
         # cand_tokens = cand_tokens_m.squeeze(0)            # [K', L]
         # logw = logw_m.squeeze(0).exp()
         # merged_cand_tokens = processor.batch_decode(cand_tokens, skip_special_tokens=True)
-        return cand_tokens,retrieval_sims_raw, teacher_conf_raw,candidate_mask, first_ids_list, first_logp_list, first_tail_list, gt_is_ranked_top, gt_rank, top_weight
+        first_ids_list = teacher_ids[b][:, 0, :]
+        first_logp_list = teacher_logprob[b][:, 0, :]
+        first_tail_list = tail_logprob[b][:, 0]
+
+        return cand_tokens, ret_scores[b], teacher_conf_raw,candidate_mask, first_ids_list, first_logp_list, first_tail_list, gt_is_ranked_top, gt_rank, top_weight, merged_scores
 
 
 prompt_base = "Answer the image related question. For fact checking questions, the desired answer would be named entities instead of common concept, for example \"Mount Everest\" instead of \"mountain top\", \"River Thames\" instead of \"river\". Be concise, output the answer only, without any additional words."
@@ -514,11 +500,18 @@ def gen(input_ds, processor, device):
         if '{' in gt[0] and '}' in gt[0]:
             gt = ast.literal_eval(gt[0])
         #score = score_infoseek(cand_answer, gt)
-
-        cand_tokens,retrieval_sims_raw, teacher_conf_raw,candidate_mask, first_ids_list, first_logp_list, first_tail_list, gt_is_ranked_top, gt_rank, top_weight = get_stats_step(model=None, processor=processor, device=device, base_inputs=inputs, input_lengths=input_lengths, answer_ids=answer_ids, answer_mask=answer_mask, teacher_ids=teacher_ids, teacher_logprob=teacher_logps, tail_logprob=teacher_tails, ret_scores=ret_scores, gt=gt, score_func=score_infoseek, tokenizer=processor.tokenizer)
         pbar.update()
-       
-        sample = {'data_id':data_id[0], 'cand_tokens': cand_tokens, 'ret_scores': retrieval_sims_raw.squeeze(0), "sum_cand_logps": teacher_conf_raw.squeeze(0), "candidate_mask":candidate_mask.squeeze(0), 'm_first_tok_id': first_ids_list[0], 'm_first_tok_logp':first_logp_list[0], 'm_first_tok_tail': first_tail_list[0], "keep": gt_is_ranked_top, "candidate_gt_rank": gt_rank, "candidate_mass":top_weight, "gt": str(gt)}
+        stats_out = get_stats_step(model=None, processor=processor, device='cpu', base_inputs=inputs, input_lengths=input_lengths, answer_ids=answer_ids, answer_mask=answer_mask, teacher_ids=teacher_ids, teacher_logprob=teacher_logps, tail_logprob=teacher_tails, ret_scores=ret_scores, gt=gt, score_func=score_infoseek, tokenizer=processor.tokenizer, tau=1.)
+        if stats_out is not None:
+            cand_tokens,retrieval_sims_raw, teacher_conf_raw,candidate_mask, first_ids_list, first_logp_list, first_tail_list, gt_is_ranked_top, gt_rank, top_weight, merged_score = stats_out
+        else:
+            continue
+        
+        if retrieval_sims_raw.size(0) == 1:
+            continue
+        elif retrieval_sims_raw.std().isnan():
+            continue
+        sample = {'data_id':data_id[0], 'cand_tokens': cand_tokens, 'ret_scores': retrieval_sims_raw, "sum_cand_logps": teacher_conf_raw.squeeze(0), "candidate_mask":candidate_mask.squeeze(0), 'm_first_tok_id': first_ids_list, 'm_first_tok_logp':first_logp_list, 'm_first_tok_tail': first_tail_list, "keep": gt_is_ranked_top, "candidate_gt_rank": gt_rank, "candidate_mass":top_weight, "gt": str(gt)}
         yield sample
 
 def process_ds():
@@ -550,9 +543,9 @@ def process_ds():
         "ret_scores": Sequence(Value("float32")),
         "sum_cand_logps": Sequence(Value("float32")),
         "candidate_mask": Sequence(Value("bool")),
-        "m_first_tok_id": Sequence(Value("int64")),
-        "m_first_tok_logp": Sequence(Value("float32")),
-        "m_first_tok_tail": Value("float32"),
+        "m_first_tok_id": Sequence(Sequence(Value("int64"))),
+        "m_first_tok_logp": Sequence(Sequence(Value("float32"))),
+        "m_first_tok_tail": Sequence(Value("float32")),
         "keep": Value("bool"),
         "candidate_gt_rank": Value("int64"),
         "candidate_mass": Value("float32"),
@@ -560,22 +553,47 @@ def process_ds():
     })
 
     train_dl = DataLoader(train_ds, batch_size=1, shuffle=False, collate_fn=collate_train_raw, prefetch_factor=2, num_workers=6)
+
     distil_dataset = HFDataset.from_generator(gen, features=features, gen_kwargs={'input_ds': train_dl, 'processor':processor, 'device': "cpu"})
     distil_dataset.save_to_disk('/data_external/InfoSeek/distill_train')
     return
+    # k=30, t=1 avg_w=0.485 avg_topgt_w=0.647 avg_r=1.89
+    # k=20, t=1 avg_w=0.514 avg_topgt_w=0.670 avg_r=1.72
+    # k=10, t=1 avg_w=0.573 avg_topgt_w=0.699 avg_r=1.48
+
+    # k=30, t=0.7 avg_w=0.489 avg_topgt_w=0.651
+    # k=20, t=0.7 avg_w=0.518 avg_topgt_w=0.666
+    # k=10, t=0.7 avg_w=0.590 avg_topgt_w=0.707
+
+    # k=30, t=0.5 avg_w=0.481 avg_topgt_w=0.645
+    # k=20, t=0.5 avg_w=0.514 avg_topgt_w=0.664
+    # k=10, t=0.5 avg_w=0.587 avg_topgt_w=0.703
+
+    # k=30, t=0.3 avg_w=0. avg_topgt_w=0.
+    # k=20, t=0.3 avg_w=0. avg_topgt_w=0.
+    # k=10, t=0.3 avg_w=0. avg_topgt_w=0.
 
 def main():
     train_ds = datasets.load_from_disk('/data_external/InfoSeek/train_gen_combined').with_format('torch')
     train_distill = datasets.load_from_disk('/data_external/InfoSeek/distill_pos').with_format('torch')
+    train_distill = train_distill.filter(lambda x: x['candidate_gt_rank'] == 0)
     #distill_pos = train_distill.filter(lambda x: x['keep'] == True)
+    
+
     train_ds = train_ds.remove_columns(["per_ev_top_ids", "per_ev_top_logps", "per_ev_tail"])
+
     #train_ds_ids = train_ds['data_id']
     #train_ds_id_map = {e: i for i,e in tqdm(enumerate(train_ds_ids), total=len(train_ds_ids))}
     train_ds_id_map = torch.load('/data_external/InfoSeek/train_ds_id_map.pt')
 
+    # train_select = train_distill['data_id']
+    # train_select = [train_ds_id_map[e] for e in train_select]
+
     #train_ds = train_ds.cast_column("image", HFImage(decode=True))
     #train_ds = train_ds.select(range(100000))
-    test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_combined').with_format('torch')
+    test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_full').with_format('torch')
+    test_ds = test_ds.filter(lambda x: x['utype'] ==  'val_unseen_question') #val_unseen_entity
+    test_ds = test_ds.select(range(10000))
 
     base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
 
@@ -592,8 +610,8 @@ def main():
     print(next(memory.parameters()).device)
     print(sum(p.numel() for p in memory.parameters()) / 1e9, "B params")
 
-    # saved_dict = torch.load('/data_external/MMPMem/checkpoints/step6000_ce_kd.pt')
-    # memory.load_state_dict(saved_dict, strict=True)
+    saved_dict = torch.load('/data_external/MMPMem/checkpoints/t1.0_k20_skd_lr2e-6_LMLastLayer.pt')
+    memory.load_state_dict(saved_dict, strict=True)
 
     model = WrappedLM(base_model, memory, config=base_model.config, processor=processor, layer_idx_for_mem=HID_LAYER_ID)
 
@@ -636,16 +654,16 @@ def main():
         # teacher_tails = row['per_ev_tail']
         # ret_scores = row['scores']
         #return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores, row['answer_eval'], row['data_id']
-        return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, row['answer_eval'], row['data_id'], distill_row['cand_tokens'], distill_row['ret_scores'], distill_row['sum_cand_logps'], distill_row['candidate_mask']
+        return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, row['answer_eval'], row['data_id'], distill_row['cand_tokens'], distill_row['ret_scores'], distill_row['sum_cand_logps'], distill_row['candidate_mask'], distill_row['m_first_tok_id'], distill_row['m_first_tok_logp'], distill_row['m_first_tok_tail'], 
 
     def collate_eval(batch):
         row = {k: [e[k] for e in batch] for k in batch[0].keys()}
         question = row['question']
         qimg = row['image']
         base_inputs = process_input_test(processor, question, qimg).to(model.device)
-        return base_inputs, row['answer_eval']
+        return base_inputs, row['answer_eval'], row['data_id']
 
-    train_dl = DataLoader(train_distill, batch_size=MACRO_BATCH_SIZE, shuffle=True, collate_fn=collate_train, num_workers=5, prefetch_factor=2,)
+    train_dl = DataLoader(train_distill, batch_size=MACRO_BATCH_SIZE, shuffle=True, collate_fn=collate_train,)# num_workers=5, prefetch_factor=2,)
     
     #train_dl = DataLoader(train_ds, batch_size=1, shuffle=True, collate_fn=collate_train_raw)
     # import re
@@ -710,7 +728,7 @@ def main():
     _memory = unw_model.memory
     
     if accel.is_main_process:
-       wandb_run = wandb.init(project="MMMem", name="CEKD")
+       wandb_run = wandb.init(project="MMMem", name=f"CEKD_t{args.ret_tau}_k{args.top_k}_skd_last_layer_lr{args.lr}")
 
     accel.wait_for_everyone()
     model.eval()
@@ -719,36 +737,95 @@ def main():
     all_gt = []
     all_pred =  []
     all_pred_base = []
+    gathered_results_mix = []
     with torch.inference_mode(), accel.join_uneven_inputs([model], even_batches=False):
         for row in tqdm(test_dl):
-            inputs, gts = row
-            output_ids = unw_model.generate(**inputs, mix_mode='base', branch="generation")
+            inputs, gts, data_ids = row
+            output_ids = unw_model.generate(**inputs, mix_mode='mix', mix_lambda=0.6, branch="generation")
             input_len = inputs.input_ids.size(1)
             generated_ids = output_ids[:, input_len:]
             text = processor.batch_decode(generated_ids, skip_special_tokens=True)
 
-            for gt, pred in zip(gts, text):
+            local_results = []
+            for gt, pred, did in zip(gts, text, data_ids):
                 if '{' in gt[0] and '}' in gt[0]:
                     gt = ast.literal_eval(gt[0])
                 score_m = score_infoseek(pred, gt)
                 correct += score_m['acc']
+                local_results.append({"c": 1 if score_m['acc']>0 else 0, "data_id": did, 'gt': gt, 'pred': pred})
                 all_gt.append(gt)
                 all_pred.append(pred)
-    
+
+            gathered = accel.gather_for_metrics(
+                local_results,
+                use_gather_object=True,
+            )
+            if accel.is_main_process:
+                # Normalize in case the gathered structure is nested by rank
+                if len(gathered) > 0 and isinstance(gathered[0], list):
+                    gathered = [x for chunk in gathered for x in chunk]
+                gathered_results_mix.extend(gathered)
 
     accel.wait_for_everyone()
     correct = accel.reduce(correct, reduction="sum")
     if accel.is_main_process:
         correct = correct.item()
+        gathered_results_mix.sort(key=lambda x: x["data_id"])
         print(correct)
-        wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
+        #wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
     accel.wait_for_everyone()
-    # 14.90
-    #base 22.4
-    # Ep0 step:
-    # 1000 14.4
-    # 3000 16.0
-    # 6000 16.1
+
+    correct = torch.tensor(0., device=model.device)
+    gathered_results_base = []
+    with torch.inference_mode(), accel.join_uneven_inputs([model], even_batches=False):
+        for row in tqdm(test_dl):
+            inputs, gts, data_ids = row
+            output_ids = unw_model.generate(**inputs, mix_mode='base', mix_lambda=0.6, branch="generation")
+            input_len = inputs.input_ids.size(1)
+            generated_ids = output_ids[:, input_len:]
+            text = processor.batch_decode(generated_ids, skip_special_tokens=True)
+
+            local_results = []
+            for gt, pred, did in zip(gts, text, data_ids):
+                if '{' in gt[0] and '}' in gt[0]:
+                    gt = ast.literal_eval(gt[0])
+                score_m = score_infoseek(pred, gt)
+                correct += score_m['acc']
+                local_results.append({"c": 1 if score_m['acc']>0 else 0, "data_id": did, 'gt': gt, 'pred': pred})
+
+            gathered = accel.gather_for_metrics(
+                local_results,
+                use_gather_object=True,
+            )
+            if accel.is_main_process:
+                # Normalize in case the gathered structure is nested by rank
+                if len(gathered) > 0 and isinstance(gathered[0], list):
+                    gathered = [x for chunk in gathered for x in chunk]
+                gathered_results_base.extend(gathered)
+
+    accel.wait_for_everyone()
+    correct = accel.reduce(correct, reduction="sum")
+    if accel.is_main_process:
+        correct = correct.item()
+        gathered_results_base.sort(key=lambda x: x["data_id"])
+        print(correct)
+        #wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
+    accel.wait_for_everyone()
+
+    torch.save([gathered_results_base, gathered_results_mix], "/latent_aug/MMPMem/result_analy.pt")
+    return
+    # unseen question 
+    # base 21.92
+    # mix 0.6 21.77
+    # Mix 0.6 LMLast 22.24
+
+    # 7512, 296
+    # 264, 1928
+
+    # unseen entity 
+    # base  18.78
+    # mix 0.6 18.69
+    # Mix 0.6 LMLast 19.02
     #         # Top 30:
     #         # 4706/10000 has GT answer in candidates
     #         # average marginalized weight for GT answer in candidates: 45.54%
@@ -768,9 +845,9 @@ def main():
         pbar = tqdm(train_dl)
         for step, batch in enumerate(train_dl):
             #inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores = batch
-            inputs, input_lengths, answer_ids, answer_mask, answer_lengths, answer_eval, data_id, cand_tokens, ret_scores, sum_cand_logps, candidate_mask = batch
+            inputs, input_lengths, answer_ids, answer_mask, answer_lengths, answer_eval, data_id, cand_tokens, ret_scores, sum_cand_logps, candidate_mask, m_first_tok_id, m_first_tok_logp, m_first_tok_tail = batch
             #stats = train_step(model,unw_model.config, accel, processor, optimizer,scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  teacher_ids, teacher_logps, teacher_tails, ret_scores)
-            stats = train_step_temperature(model,unw_model.config, accel, processor, optimizer, scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  cand_tokens, ret_scores, sum_cand_logps, candidate_mask)
+            stats = train_step_temperature(model,unw_model.config, accel, processor, optimizer, scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  cand_tokens, ret_scores, sum_cand_logps,m_first_tok_id, m_first_tok_logp, m_first_tok_tail, candidate_mask, mode="seqkd")
             
             acc_loss.append(stats['loss'])
             cur_loss = np.mean(acc_loss)
