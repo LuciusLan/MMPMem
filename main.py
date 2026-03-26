@@ -6,6 +6,7 @@ p.add_argument("--top_k", type=int, default=20)
 p.add_argument("--ce_weight", type=float, default=1.)
 p.add_argument("--kd_weight", type=float, default=0.5)
 p.add_argument("--lr", type=float, default=1e-5)
+p.add_argument("--no_tea", action="store_true")
 args = p.parse_args()
 
 import os
@@ -166,8 +167,9 @@ def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerato
         # shift_label_mask = answer_mask[:, 1:]
         # gold_flat = shift_labels[shift_label_mask]               # [N_tokens]
         # logits_flat = shift_logits[shift_label_mask]         # [N_tokens, V]
-
-        kd_loss, ce_loss, ft_kl_loss = model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, m_first_tok_id=m_first_tok_id, m_first_tok_logp=m_first_tok_logp, m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train", mode=mode, add_kl=True)
+        if args.no_tea:
+            sum_cand_logps = None
+        kd_loss, ce_loss, ft_kl_loss = model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, m_first_tok_id=m_first_tok_id, m_first_tok_logp=m_first_tok_logp, m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train", mode=mode, add_kl=False)
 
         loss = kd_loss*KD_WEIGHT + ce_loss * ALPHA_CE# + ft_kl_loss*KL_WEIGHT
         #loss = ce_loss
@@ -726,8 +728,9 @@ def main():
     unw_model = accel.unwrap_model(model)
     _memory = unw_model.memory
     
+    no_tea = "notea" if args.no_tea else ""
     if accel.is_main_process:
-       wandb_run = wandb.init(project="MMMem", name=f"CEKD_t{args.ret_tau}_k{args.top_k}_skd_last_layer_wide_lr{args.lr}")
+       wandb_run = wandb.init(project="MMMem", name=f"CEKD_t{args.ret_tau}_k{args.top_k}_skd_last_layer_wide{no_tea}_lr{args.lr}")
 
     accel.wait_for_everyone()
     model.eval()
