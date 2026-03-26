@@ -12,7 +12,7 @@ from transformers.utils import TransformersKwargs, auto_docstring, is_torchdynam
 from transformers import Qwen3VLForConditionalGeneration
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLCausalLMOutputWithPast, Qwen3VLModelOutputWithPast
 
-from seq_kd_utils import _slice_text_batch_to_single, _split_visual_inputs_qwen3vl_by_sample, _compact_right_pad_or_left_pad, token_mask_right_padded, _repeat_dynamic_cache, build_prompt_only_masks, merge_candidates_with_temperature, trim_excess_right_padding, seq_kd_loss_from_seq_logp, mml_loss_from_seq_logp
+from seq_kd_utils import _slice_text_batch_to_single, _split_visual_inputs_qwen3vl_by_sample, _compact_right_pad_or_left_pad, token_mask_right_padded, _repeat_dynamic_cache, build_prompt_only_masks, merge_candidates_with_temperature, marginalize_first_token_logp_topk, trim_excess_right_padding, seq_kd_loss_from_seq_logp, mml_loss_from_seq_logp, sparse_kl_with_tail
 
 class Qwen3VLCausalLMOutputWithPast_Pos(Qwen3VLCausalLMOutputWithPast):
     def __init__(self, *args, **kwargs):
@@ -64,7 +64,8 @@ class MemoryMLP(nn.Module):
     # TODO:
     # Bind LM head with base LM head
 
-    def __init__(self, d_in=4096, d_up=8192, num_blocks=6, vocab_size=151936,
+    #def __init__(self, d_in=4096, d_up=8192, num_blocks=6, vocab_size=151936,
+    def __init__(self, d_in=4096, d_up=14336, num_blocks=4, vocab_size=151936,
                  head='dense', head_rank=4096, norm='rms'):
         super().__init__()
         self.blocks = nn.ModuleList([MemBlock(d_in, d_up, norm=norm) for _ in range(num_blocks)])
@@ -575,7 +576,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         else:
             loss = nll_total
 
-        return loss
+        return loss, logits
 
     def compute_loss_premerged_with_ce(
         self,
@@ -583,10 +584,11 @@ class WrappedLM(nn.Module, GenerationMixin):
         prompt_inputs: dict[str, torch.Tensor],                    # BatchFeature-like dict, tensors with batch dim [B, ...]
         label_mask:torch.Tensor,
         answer_ids,
-        batch_cand_tokens, ret_scores, sum_cand_logps, candidate_mask,
+        batch_cand_tokens, ret_scores, sum_cand_logps, candidate_mask,m_first_tok_id, m_first_tok_logp, m_first_tok_tail,
         pad_id: int,
         eos_id: Optional[int],
         mode: Literal["seqkd", "mml"] = "seqkd",
+        add_kl = False,
         merge_duplicates: bool = True,
         # weighting hyperparameters
         tau_retrieval: float = 1.0,
@@ -632,6 +634,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         # Extract top-1 realized sequences (index 0) per example
         kd_losses: List[torch.Tensor] = []
         ce_losses: List[torch.Tensor] = []
+        ft_kl_losses: List[torch.Tensor] = []
 
         for b in range(B):
             sample_cand_token = batch_cand_tokens[b]
@@ -650,6 +653,10 @@ class WrappedLM(nn.Module, GenerationMixin):
                 tau_teacher=tau_teacher,
                 top_k=top_k
             )
+
+            candidate_log_weights=sample_ret_score/float(tau_retrieval)
+            uniq_ids, merged_logp, merged_tail_logp = marginalize_first_token_logp_topk(answer_ids_top32=m_first_tok_id[b], answer_logp_top32=m_first_tok_logp[b], tail_mass=m_first_tok_tail[b], candidate_mask=sample_candidate_mask, candidate_log_weights=candidate_log_weights, top_k=top_k)
+            
             #candidate_mask = None
             if len(cand_tokens) == 0:
                 kd_losses.append(prompt_inputs["input_ids"].new_zeros((), dtype=torch.float32))
@@ -683,7 +690,7 @@ class WrappedLM(nn.Module, GenerationMixin):
             suffix_position_ids = suffix_position_ids + torch.arange(L, device=device).view(1, -1)
             suffix_cache_position = torch.arange(prefix_len, prefix_len + L, device=device)
 
-            ce_loss = self.compute_ce_loss_from_prefix_cache(
+            ce_loss, logits = self.compute_ce_loss_from_prefix_cache(
                 ans_ids_1=current_gt,
                 attention_mask_1=torch.ones_like(current_gt),
                 ans_labels_1=current_gt,
@@ -692,6 +699,10 @@ class WrappedLM(nn.Module, GenerationMixin):
                 prefix_cache=prompt_cache_return,
                 logp_first_dist=logp_first_dist,
                 )
+            
+            if add_kl:
+                first_tok_kl_loss = sparse_kl_with_tail(student_logits=logits[:, 0, :], teacher_ids_with=uniq_ids.unsqueeze(0), teacher_logprob_with=merged_logp.unsqueeze(0), tail_logprob=merged_tail_logp.unsqueeze(0))
+                ft_kl_losses.append(first_tok_kl_loss)
 
             if mode == "seqkd":
                 loss_b = seq_kd_loss_from_seq_logp(
@@ -716,12 +727,22 @@ class WrappedLM(nn.Module, GenerationMixin):
 
         kd_losses = torch.stack(kd_losses, dim=0)  # [B]
         ce_losses = torch.stack(ce_losses, dim=0)
+        ft_kl_losses= torch.stack(ft_kl_losses, dim=0)
         if reduction == "none":
-            return kd_losses, ce_losses
+            if add_kl:
+                return kd_losses, ce_losses, ft_kl_losses
+            else:
+                return kd_losses, ce_losses
         if reduction == "sum":
-            return kd_losses.sum(), ce_losses.sum()
+            if add_kl:
+                return kd_losses.sum(), ce_losses.sum(), ft_kl_losses.sum()
+            else:
+                return kd_losses.sum(), ce_losses.sum()
         if reduction == "mean":
-            return kd_losses.mean(), ce_losses.mean()
+            if add_kl:
+                return kd_losses.mean(), ce_losses.mean(), ft_kl_losses.mean()
+            else:
+                return kd_losses.mean(), ce_losses.mean()
         raise ValueError(f"Unknown reduction: {reduction}")
 
     def forward(
@@ -738,7 +759,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep=0,
         mix_mode='base',
-        mix_lambda=0.4,
+        mix_lambda=0.6,
 
         model_config=None,
         prompt_inputs=None, 
@@ -746,7 +767,10 @@ class WrappedLM(nn.Module, GenerationMixin):
         answer_ids=None, 
         batch_cand_tokens=None, 
         ret_scores=None, 
-        sum_cand_logps=None, 
+        sum_cand_logps=None,
+        m_first_tok_id=None, 
+        m_first_tok_logp=None, 
+        m_first_tok_tail=None,
         candidate_mask=None, 
         pad_id=None, 
         eos_id=None, 
@@ -754,6 +778,8 @@ class WrappedLM(nn.Module, GenerationMixin):
         tau_retrieval=None, 
         top_k=None,
         mode=None,
+        add_kl=False,
+
         branch=None,
         **kwargs: Unpack[TransformersKwargs],):
         if branch == "generation":
@@ -773,10 +799,11 @@ class WrappedLM(nn.Module, GenerationMixin):
                 mix_lambda=mix_lambda,
                 **kwargs,)
         elif branch == "train":
-            if mode == None:
-                mode = 'mml'
+            if mode is None:
+                mode = "mml"
             out = self.compute_loss_premerged_with_ce(
-            model_config=model_config, prompt_inputs=prompt_inputs, label_mask=label_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, candidate_mask=candidate_mask, pad_id=self.pad_token_id, eos_id=self.eos_token_id, detach_prompt_cache=detach_prompt_cache, tau_retrieval=tau_retrieval, top_k=top_k, chunk_size=20, mode=mode
+            model_config=model_config, prompt_inputs=prompt_inputs, label_mask=label_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, m_first_tok_id=m_first_tok_id,m_first_tok_logp=m_first_tok_logp, 
+            m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=self.pad_token_id, eos_id=self.eos_token_id, detach_prompt_cache=detach_prompt_cache, tau_retrieval=tau_retrieval, top_k=top_k, chunk_size=20, mode=mode, add_kl=add_kl
         )
         
         return out

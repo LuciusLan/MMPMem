@@ -2,7 +2,7 @@ import os, json, math, argparse
 
 
 #os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ['CUDA_VISIBLE_DEVICES']="2"
+os.environ['CUDA_VISIBLE_DEVICES']="1"
 os.environ["HF_HOME"]='/data_external/hf_cache'
 #os.environ['VLLM_FLASH_ATTN_VERSION']="2"
 os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
@@ -16,9 +16,11 @@ import uuid, hashlib
 import itertools
 import time
 import re
+import random
 
 import torch
 from torch.utils.data import Dataset, DataLoader
+import numpy as np
 from transformers import Qwen3VLProcessor, AutoConfig,Qwen3VLForConditionalGeneration
 from PIL import Image
 import datasets
@@ -27,9 +29,20 @@ from vllm import LLM, SamplingParams
 from vllm.inputs.data import TextPrompt
 from tqdm import tqdm
 
-from modelling_memory import MemoryMLP
+from modelling_memory import MemoryMLP, WrappedLM
 from inference import generate_with_memory
 from eval_util import score_infoseek
+
+def set_determinism(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+
+set_determinism(2026)
 
 mcq_keys = ['A', 'B', 'C', 'D']
 test_ds = datasets.load_from_disk('/data_external/MRAG')
@@ -38,12 +51,16 @@ test_ds:HFDataset = datasets.concatenate_datasets([test_ds['train'], test_ds['te
 test_ds = test_ds.cast_column('image', HFImage(decode=True))
 
 processor= Qwen3VLProcessor.from_pretrained('/wyy/models/Qwen3-VL-8B-Instruct')
-model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16, device_map='cpu')
-model = model.to('cuda')
+base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
+
 memory = MemoryMLP()
-saved_dict = torch.load('/data_external/MMPMem/checkpoints/11.pt')
-memory.load_state_dict(saved_dict, strict=True)
 memory = memory.to('cuda')
+saved_dict = torch.load('/data_external/MMPMem/checkpoints/t1.0_k20_skd_lr1e-06.pt')
+memory.load_state_dict(saved_dict, strict=True)
+
+model = WrappedLM(base_model, memory, config=base_model.config, processor=processor, layer_idx_for_mem=32)
+
+
 
 
 def process_prompt(inputs):
@@ -93,7 +110,10 @@ for step,row in enumerate(test_ds):
     inputs = process_prompt(row)
     inputs = inputs.to('cuda')
     with torch.inference_mode():
-        gid, text, text_base = generate_with_memory(model, memory, processor.tokenizer, inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=0.6)
+        output_ids = model.generate(**inputs, mix_mode='mix', mix_lambda=0.65, branch="generation")
+        input_len = inputs.input_ids.size(1)
+        generated_ids = output_ids[:, input_len:]
+        text = processor.decode(generated_ids, skip_special_tokens=True)[0]
         #gid, _, text_base = generate_with_memory(model, memory, processor.tokenizer, inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=1.)
     
 
@@ -108,22 +128,25 @@ for step,row in enumerate(test_ds):
     else:
         mm_correct = False
     
-    try:
-        pred_base = re.search(r'\\boxed\{(.+)\}', text_base.lower(), re.DOTALL)
-        pred_base = pred_base.groups()[0]
-    except:
-        pred_base = text_base
-    if row['answer_choice'].lower() in pred_base.lower() or row['answer'].lower() in text_base.lower():
-        cb +=1
-        base_correct = True
-    else:
-        base_correct = False
+    # try:
+    #     pred_base = re.search(r'\\boxed\{(.+)\}', text_base.lower(), re.DOTALL)
+    #     pred_base = pred_base.groups()[0]
+    # except:
+    #     pred_base = text_base
+    # if row['answer_choice'].lower() in pred_base.lower() or row['answer'].lower() in text_base.lower():
+    #     cb +=1
+    #     base_correct = True
+    # else:
+    #     base_correct = False
     
-    if base_correct and not mm_corect:
-        pm_wrong.append([row['answer_choice'], text, text_base])
+    # if base_correct and not mm_corect:
+    #     pm_wrong.append([row['answer_choice'], text, text_base])
 
     pbar.update()
     pbar.set_postfix({'BaseLM ACC': 100*(cb/(1+step)), 'PMM ACC':  100*(cm/(1+step))})
+
+    # MPM Best 68.07
+print(100*(cm/(1+step)))
 
 pass
 

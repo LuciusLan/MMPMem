@@ -497,6 +497,7 @@ def label_candidate(
     keep = False
     debug: List[Dict[str, Any]] = []
 
+    #K = min(K, 10)
     for b in range(B):
         score = retrieval_sims_raw[b] / float(tau_retrieval)  # [K]
         if teacher_conf_raw is not None:
@@ -550,154 +551,65 @@ def label_candidate(
             seq_text = tokenizer.decode(seq, skip_special_tokens=True)
             score =score_func(seq_text, gt)
             if score['acc']>0:
-                if idx == 0:
+                if idx == 0 or idx ==1:
                     keep = True
                 gt_rank = idx
                 gt_weight = norm_weights[idx].item()
                 break
 
-    return keep, gt_rank, gt_weight
+    return keep, gt_rank, gt_weight, torch.stack([e[1] for e in ranked], dim=0)
 
-def marginalize_first_token_logp(
-    *,
-    answer_ids_top32_list: List[torch.Tensor],          # each [K_b, L_b, 32]
-    answer_logp_top32_list: List[torch.Tensor],         # each [K_b, L_b, 32]
-    tail_mass_list: Optional[List[torch.Tensor]] = None,# each [K_b, L_b], optional
-    retrieval_sims_list: Optional[List[torch.Tensor]] = None,       # each [K_b]
-    candidate_log_weights_list: Optional[List[torch.Tensor]] = None,# each [K_b]
-    normalize_candidate_weights: bool = True,
-    tau_retrieval: float = 1.0,
-    candidate_mask_list: Optional[List[torch.Tensor]] = None,       # each [K_b] bool
-) -> Tuple[List[torch.Tensor], List[torch.Tensor], Optional[List[torch.Tensor]]]:
-    """
-    Marginalize the first-token distribution across candidates.
+def softmax_T(logits, T=1.0):
+    return F.softmax(logits / T, dim=-1)
 
-    For each example b:
-        q_b(v) = sum_k w_{b,k} * p_teacher(v | candidate k, first position)
+def kl_divergence(p_logit, q_logit, T=1.0, eps=1e-8):
+    # KL( p || q ); both inputs are logits
+    p = softmax_T(p_logit, T)
+    q = softmax_T(q_logit, T)
+    return torch.sum(p * (torch.log(p + eps) - torch.log(q + eps)), dim=-1)
 
-    where p_teacher is represented sparsely by top-32 ids/logprobs at the first position.
+def sparse_kl_with_tail(
+    student_logits,   # [A, V] logits from base+memory at answer positions
+    teacher_ids_with,          # [A, M] teacher union token ids (=-1 means padding)
+    teacher_logprob_with,         # [A, M] teacher log-probs on union tokens
+    tail_logprob         # [A]    teacher log-prob for OTHER bucket
+):
+    eps = 1e-8
 
-    Returns:
-        merged_first_token_ids_list:
-            list of [N_b] unique token ids
-        merged_first_token_log_probs_list:
-            list of [N_b] log-probs for those token ids
-        merged_first_token_tail_log_mass_list:
-            list of [] scalar log tail-mass, if tail_mass_list is provided; else None
+    # log p_student over full vocab
+    # [B, A, V]
+    log_p_s = F.log_softmax(student_logits, dim=-1)
 
-    Notes:
-    - This function marginalizes only the first-token distribution.
-    - `tail_mass_list[b][k, 0]` is assumed to be the teacher's leftover probability mass
-      after the stored top-32 tokens at the first position.
-    - If `candidate_log_weights_list` is provided, it is used directly.
-      Otherwise `retrieval_sims_list` must be provided.
-    - If `normalize_candidate_weights=True`, candidate weights are normalized per example
-      with log_softmax (recommended).
-    """
+    # teacher top-K probs (optionally renormalized with tail)
+    # [B, A, K]
+    p_t_topk = torch.exp(teacher_logprob_with)
+    p_t_tail = torch.exp(tail_logprob).unsqueeze(-1)  # [B, A, 1]
 
-    if candidate_log_weights_list is None and retrieval_sims_list is None:
-        raise ValueError("Provide either candidate_log_weights_list or retrieval_sims_list.")
+    # Optional: renormalize (robust if teacher probs are not perfectly normalized)
+    mass_topk = p_t_topk.sum(-1, keepdim=True)        # [B, A, 1]
+    Z = (mass_topk + p_t_tail).clamp_min(eps)         # [B, A, 1]
+    p_t_topk = p_t_topk / Z
+    p_t_tail = p_t_tail / Z
 
-    B = len(answer_ids_top32_list)
-    assert len(answer_logp_top32_list) == B
-    if tail_mass_list is not None:
-        assert len(tail_mass_list) == B
-    if retrieval_sims_list is not None:
-        assert len(retrieval_sims_list) == B
-    if candidate_log_weights_list is not None:
-        assert len(candidate_log_weights_list) == B
-    if candidate_mask_list is not None:
-        assert len(candidate_mask_list) == B
+    log_p_t_topk = torch.log(p_t_topk + eps)          # [B, A, K]
+    log_p_t_tail = torch.log(p_t_tail + eps).squeeze(-1)  # [B, A]
 
-    merged_ids_list: List[torch.Tensor] = []
-    merged_logp_list: List[torch.Tensor] = []
-    merged_tail_list: List[torch.Tensor] = []
+    # log p_student on teacher's top-K tokens
+    # teacher_ids_with: [B, A, K]
+    log_p_s_topk = log_p_s.gather(dim=-1, index=teacher_ids_with)  # [B, A, K]
+    p_s_topk     = torch.exp(log_p_s_topk)                         # [B, A, K]
 
-    for b in range(B):
-        ids_b = answer_ids_top32_list[b]         # [K_b, L_b, 32]
-        logp_b = answer_logp_top32_list[b]       # [K_b, L_b, 32]
-        device = ids_b.device
+    # student tail mass = 1 - sum_{topK} p_s
+    p_s_topk_sum = p_s_topk.sum(-1)               # [B, A]
+    p_s_tail     = (1.0 - p_s_topk_sum).clamp_min(eps)   # [B, A]
+    log_p_s_tail = torch.log(p_s_tail)            # [B, A]
 
-        Kb = ids_b.shape[0]
-        if Kb == 0:
-            merged_ids_list.append(torch.empty(0, dtype=torch.long, device=device))
-            merged_logp_list.append(torch.empty(0, dtype=logp_b.dtype, device=device))
-            if tail_mass_list is not None:
-                merged_tail_list.append(torch.tensor(float("-inf"), dtype=logp_b.dtype, device=device))
-            continue
+    # KL = sum_i p_t(i) [log p_t(i)-log p_s(i)] + p_tail[log p_tail-log p_s_tail]
+    term_topk = (p_t_topk * (log_p_t_topk - log_p_s_topk)).sum(-1)  # [B, A]
+    term_tail = p_t_tail.squeeze(-1) * (log_p_t_tail - log_p_s_tail)  # [B, A]
 
-        if candidate_mask_list is None:
-            cand_mask = torch.ones(Kb, dtype=torch.bool, device=device)
-        else:
-            cand_mask = candidate_mask_list[b].to(device=device, dtype=torch.bool)
-
-        # ---- candidate log weights ----
-        if candidate_log_weights_list is not None:
-            logw = candidate_log_weights_list[b].to(device=device, dtype=logp_b.dtype)  # [K_b]
-        else:
-            sims = retrieval_sims_list[b].to(device=device, dtype=logp_b.dtype) / float(tau_retrieval)
-            sims = sims.masked_fill(~cand_mask, float("-inf"))
-            logw = sims
-
-        logw = logw.masked_fill(~cand_mask, float("-inf"))
-
-        if normalize_candidate_weights:
-            logw = F.log_softmax(logw, dim=0)  # [K_b]
-
-        # ---- first-position sparse teacher distribution ----
-        first_ids = ids_b[:, 0, :]    # [K_b, 32]
-        first_logp = logp_b[:, 0, :]  # [K_b, 32]
-
-        # Aggregate q(v) = sum_k w_k p_k(v) over duplicate token ids
-        acc = {}  # token_id -> logprob
-        for k in range(Kb):
-            if not cand_mask[k] or not torch.isfinite(logw[k]):
-                continue
-
-            ids_k = first_ids[k]      # [32]
-            logp_k = first_logp[k]    # [32]
-
-            # In case the same token id appears multiple times in top-32 (rare), merge within candidate first
-            local_acc = {}
-            for t in range(ids_k.shape[0]):
-                tok = int(ids_k[t].item())
-                val = logw[k] + logp_k[t]
-                if tok in local_acc:
-                    local_acc[tok] = torch.logaddexp(local_acc[tok], val)
-                else:
-                    local_acc[tok] = val
-
-            # Merge into global accumulator
-            for tok, val in local_acc.items():
-                if tok in acc:
-                    acc[tok] = torch.logaddexp(acc[tok], val)
-                else:
-                    acc[tok] = val
-
-        if len(acc) == 0:
-            merged_ids = torch.empty(0, dtype=torch.long, device=device)
-            merged_logp = torch.empty(0, dtype=logp_b.dtype, device=device)
-        else:
-            toks = sorted(acc.keys())
-            merged_ids = torch.tensor(toks, dtype=torch.long, device=device)
-            merged_logp = torch.stack([acc[t] for t in toks], dim=0)
-
-        merged_ids_list.append(merged_ids)
-        merged_logp_list.append(merged_logp)
-
-        # ---- optional marginalized tail mass ----
-        if tail_mass_list is not None:
-            tail_b = tail_mass_list[b].to(device=device, dtype=logp_b.dtype)  # [K_b, L_b]
-            first_tail = tail_b[:, 0]  # [K_b]
-
-            tail_terms = logw + first_tail
-            tail_terms = tail_terms.masked_fill(~cand_mask, float("-inf"))
-            merged_tail = torch.logsumexp(tail_terms, dim=0)  # scalar
-            merged_tail_list.append(merged_tail)
-
-    if tail_mass_list is not None:
-        return merged_ids_list, merged_logp_list, merged_tail_list
-    return merged_ids_list, merged_logp_list, None
+    kl = term_topk + term_tail    # [B, A]
+    return kl.mean()              # scalar
 
 # ----------------------------
 # Optional: merge duplicate candidate sequences (within each original query)
@@ -1293,6 +1205,109 @@ def compute_seqkd_or_mml_loss(
         return loss_vec.mean()
     raise ValueError(f"Unknown reduction: {reduction}")
 
+def marginalize_first_token_logp_topk(
+    answer_ids_top32: torch.Tensor,         # [K, L, 32] or [K, 32]  (token ids)
+    answer_logp_top32: torch.Tensor,        # [K, L, 32] or [K, 32]  (log-probs)
+    candidate_log_weights: torch.Tensor,    # [K]
+    candidate_mask: torch.Tensor,           # [K] bool
+    top_k: Optional[int] = None,
+    tail_mass: Optional[torch.Tensor] = None,  # [K, L] or [K], probability mass (NOT log) outside top-32
+    sort_desc: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Marginalize the first-token teacher distribution over the top-k valid candidates.
+
+    Steps:
+      1) apply candidate_mask
+      2) keep top-k candidates by candidate_log_weights
+      3) normalize candidate weights over the selected candidates
+      4) form mixture over each candidate's first-token top-32 distribution
+      5) aggregate duplicate token ids by logaddexp
+
+    Returns:
+      merged_token_ids:   [U] unique first-token ids after aggregation
+      merged_log_probs:   [U] log p(token) after marginalization
+      merged_tail_logp:   scalar tensor or None
+                          = log of total tail mass after marginalization
+                          (mass outside the returned merged_token_ids)
+
+    Notes:
+      - This function uses ONLY the first decoding position.
+      - If `answer_ids_top32` / `answer_logp_top32` are [K, L, 32], position 0 is used.
+      - `tail_mass` should be probability mass, not log-mass.
+      - If you do not want tail handling, pass `tail_mass=None`.
+    """
+    device = candidate_log_weights.device
+    candidate_mask = candidate_mask.to(torch.bool)
+
+    if answer_ids_top32.dim() == 3:
+        first_ids = answer_ids_top32[:, 0, :]      # [K, 32]
+        first_logp = answer_logp_top32[:, 0, :]    # [K, 32]
+        first_tail = tail_mass[:, 0] if tail_mass is not None else None  # [K]
+    elif answer_ids_top32.dim() == 2:
+        first_ids = answer_ids_top32               # [K, 32]
+        first_logp = answer_logp_top32             # [K, 32]
+        first_tail = tail_mass if tail_mass is not None else None        # [K]
+    else:
+        raise ValueError("answer_ids_top32 must have shape [K, L, 32] or [K, 32].")
+
+    valid_idx = torch.nonzero(candidate_mask, as_tuple=False).squeeze(-1)
+    if valid_idx.numel() == 0:
+        empty_ids = torch.empty(0, dtype=first_ids.dtype, device=device)
+        empty_logp = torch.empty(0, dtype=first_logp.dtype, device=device)
+        empty_tail = torch.tensor(float("-inf"), dtype=first_logp.dtype, device=device) if tail_mass is not None else None
+        return empty_ids, empty_logp, empty_tail
+
+    # top-k AFTER applying candidate_mask
+    valid_logw = candidate_log_weights[valid_idx]
+    if top_k is not None and top_k < valid_idx.numel():
+        _, top_pos = torch.topk(valid_logw, k=top_k, dim=0)
+        sel_idx = valid_idx[top_pos]
+    else:
+        sel_idx = valid_idx
+
+    sel_logw = candidate_log_weights[sel_idx]          # [K']
+    sel_logw = sel_logw - torch.logsumexp(sel_logw, dim=0)  # normalize over selected candidates
+
+    sel_ids = first_ids[sel_idx]                       # [K', 32]
+    sel_first_logp = first_logp[sel_idx]               # [K', 32]
+
+    # mixture contribution for each sparse token entry
+    # log p_mix(token entry) = log w(candidate) + log p_teacher(token | candidate)
+    contrib_logp = sel_logw[:, None] + sel_first_logp  # [K', 32]
+
+    flat_ids = sel_ids.reshape(-1)                     # [K'*32]
+    flat_logp = contrib_logp.reshape(-1)               # [K'*32]
+
+    # aggregate duplicate token ids by logaddexp
+    uniq_ids, inverse = torch.unique(flat_ids, sorted=False, return_inverse=True)
+    merged_logp = torch.full(
+        (uniq_ids.numel(),),
+        float("-inf"),
+        dtype=flat_logp.dtype,
+        device=device,
+    )
+    for j in range(flat_logp.numel()):
+        merged_logp[inverse[j]] = torch.logaddexp(merged_logp[inverse[j]], flat_logp[j])
+
+    merged_tail_logp = None
+    if first_tail is not None:
+        sel_tail = first_tail[sel_idx].clamp_min(0.0)  # [K']
+        if torch.any(sel_tail > 0):
+            merged_tail_logp = torch.logsumexp(
+                sel_logw + torch.log(sel_tail.clamp_min(torch.finfo(sel_tail.dtype).tiny)),
+                dim=0,
+            )
+        else:
+            merged_tail_logp = torch.tensor(float("-inf"), dtype=flat_logp.dtype, device=device)
+
+    if sort_desc and merged_logp.numel() > 0:
+        order = torch.argsort(merged_logp, descending=True)
+        uniq_ids = uniq_ids[order]
+        merged_logp = merged_logp[order]
+
+    return uniq_ids, merged_logp, merged_tail_logp
+
 def merge_candidates_with_temperature(
     cand_tokens: torch.Tensor,              # [K, L]
     retrieval_sims_raw: torch.Tensor,       # [K]
@@ -1362,6 +1377,8 @@ def merge_candidates_with_temperature(
     merged_map: Dict[Tuple[int, ...], Tuple[torch.Tensor, torch.Tensor]] = {}
     # value = (merged_score, representative_padded_tokens)
 
+    if not candidate_mask.all():
+        pass
     for i in range(kept_tokens.shape[0]):
         seq_i = kept_tokens[i]
         mask_i = seq_mask[i]
