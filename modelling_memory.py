@@ -64,7 +64,8 @@ class MemoryMLP(nn.Module):
     # TODO:
     # Bind LM head with base LM head
 
-    def __init__(self, d_in=4096, d_up=8192, num_blocks=6, vocab_size=151936,
+    #def __init__(self, d_in=4096, d_up=8192, num_blocks=6, vocab_size=151936,
+    def __init__(self, d_in=4096, d_up=14336, num_blocks=4, vocab_size=151936,
                  head='dense', head_rank=4096, norm='rms'):
         super().__init__()
         self.blocks = nn.ModuleList([MemBlock(d_in, d_up, norm=norm) for _ in range(num_blocks)])
