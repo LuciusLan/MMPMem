@@ -27,7 +27,7 @@ class SwiGLU(nn.Module):
         self.w_in = nn.Linear(d_in, 2 * d_up, bias=False)
         self.w_out = nn.Linear(d_up, d_in, bias=False)
 
-        nn.init.kaiming_uniform_(self.w_in.weight, nonlinearity="relu")
+        nn.init.kaiming_uniform_(self.w_in.weight,)
         #nn.init.zeros_(self.w_in.bias)
         nn.init.xavier_uniform_(self.w_out.weight)
         #nn.init.zeros_(self.w_out.bias)

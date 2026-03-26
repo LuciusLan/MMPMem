@@ -591,9 +591,9 @@ def main():
 
     #train_ds = train_ds.cast_column("image", HFImage(decode=True))
     #train_ds = train_ds.select(range(100000))
-    test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_full').with_format('torch')
-    test_ds = test_ds.filter(lambda x: x['utype'] == 'val_unseen_entity') #val_unseen_question
-    test_ds = test_ds.select(range(1000))
+    test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_combined').with_format('torch')
+    #test_ds = test_ds.filter(lambda x: x['utype'] == 'val_unseen_question') #val_unseen_entity
+    #test_ds = test_ds.select(range(1000))
 
     base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
 
@@ -663,7 +663,7 @@ def main():
         base_inputs = process_input_test(processor, question, qimg).to(model.device)
         return base_inputs, row['answer_eval'], row['data_id']
 
-    train_dl = DataLoader(train_distill, batch_size=MACRO_BATCH_SIZE, shuffle=True, collate_fn=collate_train,)# num_workers=5, prefetch_factor=2,)
+    train_dl = DataLoader(train_distill, batch_size=MACRO_BATCH_SIZE, shuffle=True, collate_fn=collate_train, num_workers=5, prefetch_factor=2,)
     
     #train_dl = DataLoader(train_ds, batch_size=1, shuffle=True, collate_fn=collate_train_raw)
     # import re
