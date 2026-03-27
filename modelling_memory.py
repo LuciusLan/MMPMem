@@ -27,7 +27,7 @@ class SwiGLU(nn.Module):
         self.w_in = nn.Linear(d_in, 2 * d_up, bias=False)
         self.w_out = nn.Linear(d_up, d_in, bias=False)
 
-        nn.init.kaiming_uniform_(self.w_in.weight, nonlinearity="relu")
+        nn.init.kaiming_uniform_(self.w_in.weight,)
         #nn.init.zeros_(self.w_in.bias)
         nn.init.xavier_uniform_(self.w_out.weight)
         #nn.init.zeros_(self.w_out.bias)
@@ -311,7 +311,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         eos_id: Optional[int],
         chunk_size: int = 16,
         include_eos: bool = True,
-        length_norm: Literal["none", "mean"] = "none",
+        length_norm: Literal["none", "mean"] = "mean",
         detach_prompt_cache: bool = False,
     ) -> tuple[torch.Tensor, Cache, torch.Tensor, torch.Tensor] :
         """
@@ -587,7 +587,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         batch_cand_tokens, ret_scores, sum_cand_logps, candidate_mask,m_first_tok_id, m_first_tok_logp, m_first_tok_tail,
         pad_id: int,
         eos_id: Optional[int],
-        mode: Literal["seqkd", "mml"] = "seqkd",
+        mode: Literal["seqkd", "mml", "listkl"] = "seqkd",
         add_kl = False,
         merge_duplicates: bool = True,
         # weighting hyperparameters
@@ -598,7 +598,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         include_eos_in_teacher_conf: bool = True,
         # student scoring
         chunk_size: int = 8,
-        student_length_norm: Literal["none", "mean"] = "none",
+        student_length_norm: Literal["none", "mean"] = "mean",
         detach_prompt_cache: bool = False,
         # reduction
         reduction: Literal["mean", "sum", "none"] = "mean",
@@ -637,6 +637,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         ce_losses: List[torch.Tensor] = []
         ft_kl_losses: List[torch.Tensor] = []
 
+        valid_mask = torch.ones([B], dtype=torch.bfloat16, device=device)
         for b in range(B):
             sample_cand_token = batch_cand_tokens[b]
             sample_ret_score = ret_scores[b]
@@ -649,7 +650,7 @@ class WrappedLM(nn.Module, GenerationMixin):
             cand_tokens, logw, merged_score = merge_candidates_with_temperature(
                 cand_tokens=sample_cand_token,
                 retrieval_sims_raw=sample_ret_score,
-                teacher_conf_raw=sample_teacher_conf,
+                teacher_conf_raw=None, #sample_teacher_conf,
                 candidate_mask=sample_candidate_mask,
                 pad_id=pad_id,
                 eos_id=eos_id,
@@ -658,8 +659,9 @@ class WrappedLM(nn.Module, GenerationMixin):
                 top_k=top_k
             )
 
-            candidate_log_weights=sample_ret_score/float(tau_retrieval)
-            uniq_ids, merged_logp, merged_tail_logp = marginalize_first_token_logp_topk(answer_ids_top32=m_first_tok_id[b], answer_logp_top32=m_first_tok_logp[b], tail_mass=m_first_tok_tail[b], candidate_mask=sample_candidate_mask, candidate_log_weights=candidate_log_weights, top_k=top_k)
+            if add_kl:
+                candidate_log_weights=sample_ret_score/float(tau_retrieval)
+                uniq_ids, merged_logp, merged_tail_logp = marginalize_first_token_logp_topk(answer_ids_top32=m_first_tok_id[b], answer_logp_top32=m_first_tok_logp[b], tail_mass=m_first_tok_tail[b], candidate_mask=sample_candidate_mask, candidate_log_weights=candidate_log_weights, top_k=top_k)
             
             #candidate_mask = None
             if len(cand_tokens) == 0:
@@ -704,35 +706,51 @@ class WrappedLM(nn.Module, GenerationMixin):
                 logp_first_dist=logp_first_dist,
                 )
             
-            if add_kl:
-                first_tok_kl_loss = sparse_kl_with_tail(student_logits=logits[:, 0, :], teacher_ids_with=uniq_ids.unsqueeze(0), teacher_logprob_with=merged_logp.unsqueeze(0), tail_logprob=merged_tail_logp.unsqueeze(0))
-                ft_kl_losses.append(first_tok_kl_loss)
+            if logw.size(0) > 1:
 
-            if mode == "seqkd":
-                loss_b = seq_kd_loss_from_seq_logp(
-                    student_seq_logp=student_seq_logp.unsqueeze(0),
-                    logw=logw.unsqueeze(0),
-                    candidate_mask=None,
-                    reduction="none",
-                ).squeeze(0)
-            elif mode == "mml":
-                loss_b = mml_loss_from_seq_logp(
-                    student_seq_logp=student_seq_logp.unsqueeze(0),
-                    logw=logw.unsqueeze(0),
-                    candidate_mask=None,
-                    reduction="none",
-                ).squeeze(0)
+                if add_kl:
+                    first_tok_kl_loss = sparse_kl_with_tail(student_logits=logits[:, 0, :], teacher_ids_with=uniq_ids.unsqueeze(0), teacher_logprob_with=merged_logp.unsqueeze(0), tail_logprob=merged_tail_logp.unsqueeze(0))
+                    ft_kl_losses.append(first_tok_kl_loss)
+
+                if mode == "seqkd":
+                    loss_b = seq_kd_loss_from_seq_logp(
+                        student_seq_logp=student_seq_logp.unsqueeze(0),
+                        logw=logw.unsqueeze(0),
+                        candidate_mask=None,
+                        reduction="none",
+                    ).squeeze(0)
+                elif mode == "mml":
+                    loss_b = mml_loss_from_seq_logp(
+                        student_seq_logp=student_seq_logp.unsqueeze(0),
+                        logw=logw.unsqueeze(0),
+                        candidate_mask=None,
+                        reduction="none",
+                    ).squeeze(0)
+                elif mode == 'listkl':
+                    loss_b = listwise_kl_loss(student_seq_logp, merged_score)
+                else:
+                    raise ValueError(f"Unknown mode: {mode}")
+
+                kd_losses.append(loss_b)
             else:
-                raise ValueError(f"Unknown mode: {mode}")
+                valid_mask[b] = 0.5
 
-            kd_losses.append(loss_b)
             ce_losses.append(ce_loss)
             del prompt_cache_return
 
-        kd_losses = torch.stack(kd_losses, dim=0)  # [B]
+
         ce_losses = torch.stack(ce_losses, dim=0)
-        if add_kl:
-            ft_kl_losses= torch.stack(ft_kl_losses, dim=0)
+        ce_losses = ce_losses * valid_mask # Scale CE Loss for samples having only one merged candidate
+
+        if len(kd_losses) > 0:
+            kd_losses = torch.stack(kd_losses, dim=0)  # [B]
+            if add_kl:
+                ft_kl_losses= torch.stack(ft_kl_losses, dim=0)
+        else:
+            kd_losses = ce_losses.new_zeros(())
+            if add_kl:
+                ft_kl_losses = ce_losses.new_zeros(())
+
         if reduction == "none":
             if add_kl:
                 return kd_losses, ce_losses, ft_kl_losses
@@ -747,7 +765,7 @@ class WrappedLM(nn.Module, GenerationMixin):
             if add_kl:
                 return kd_losses.mean(), ce_losses.mean(), ft_kl_losses.mean()
             else:
-                return kd_losses.mean(), ce_losses.mean()
+                return kd_losses.mean(), ce_losses.mean(), valid_mask.sum()
         raise ValueError(f"Unknown reduction: {reduction}")
 
     def forward(
@@ -812,3 +830,65 @@ class WrappedLM(nn.Module, GenerationMixin):
         )
         
         return out
+
+def build_teacher_target(retrieval_scores, teacher_seq_mean_logprobs, merge_ids,
+                         tau_r=1.0, tau_t=1.0, beta=0.1, eps=1e-8):
+    """
+    retrieval_scores: [n_proxy]
+    teacher_seq_mean_logprobs: [n_proxy]
+    merge_ids: [n_proxy], int id of merged candidate for each proxy
+    returns q: [n_merged]
+    """
+
+    # query-local normalization
+    r = (retrieval_scores - retrieval_scores.mean()) / (retrieval_scores.std() + eps)
+    #l = (teacher_seq_mean_logprobs - teacher_seq_mean_logprobs.mean()) / (
+    #    teacher_seq_mean_logprobs.std() + eps
+    #)
+
+    proxy_logits = r / tau_r #+ beta * (l / tau_t)
+    proxy_log_probs = F.log_softmax(proxy_logits, dim=0)   # [n_proxy]
+    proxy_probs = proxy_log_probs.exp()
+
+    n_merged = int(merge_ids.max().item()) + 1
+    q = torch.zeros(n_merged, device=proxy_probs.device)
+    q.scatter_add_(0, merge_ids, proxy_probs)
+
+    q = q / (q.sum() + eps)
+    return q
+
+def build_teacher_target(retrieval_scores, teacher_seq_mean_logprobs, merge_ids,
+                         tau_r=1.0, tau_t=1.0, beta=0.1, eps=1e-8):
+    """
+    retrieval_scores: [n_proxy]
+    teacher_seq_mean_logprobs: [n_proxy]
+    merge_ids: [n_proxy], int id of merged candidate for each proxy
+    returns q: [n_merged]
+    """
+
+    # query-local normalization
+    r = (retrieval_scores - retrieval_scores.mean()) / (retrieval_scores.std() + eps)
+    l = (teacher_seq_mean_logprobs - teacher_seq_mean_logprobs.mean()) / (
+        teacher_seq_mean_logprobs.std() + eps
+    )
+
+    proxy_logits = r / tau_r + beta * (l / tau_t)
+    proxy_log_probs = F.log_softmax(proxy_logits, dim=0)   # [n_proxy]
+    proxy_probs = proxy_log_probs.exp()
+
+    n_merged = int(merge_ids.max().item()) + 1
+    q = torch.zeros(n_merged, device=proxy_probs.device)
+    q.scatter_add_(0, merge_ids, proxy_probs)
+
+    q = q / (q.sum() + eps)
+    return q
+
+def listwise_kl_loss(seq_scores, teacher_target_q, tau_s=1.0):
+    """
+    seq_scores: [m]
+    teacher_target_q: [m], sums to 1
+    """
+    teacher_target_q = teacher_target_q.softmax(-1)
+    student_log_probs = F.log_softmax(seq_scores / tau_s, dim=0)
+    loss = F.kl_div(student_log_probs, teacher_target_q, reduction="sum")
+    return loss
