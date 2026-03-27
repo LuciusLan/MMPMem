@@ -629,7 +629,8 @@ class WrappedLM(nn.Module, GenerationMixin):
 
 
         assert len(batch_cand_tokens) == B
-        assert len(sum_cand_logps) == B
+        if sum_cand_logps is not None:
+            assert len(sum_cand_logps) == B
 
         # Extract top-1 realized sequences (index 0) per example
         kd_losses: List[torch.Tensor] = []
@@ -640,7 +641,10 @@ class WrappedLM(nn.Module, GenerationMixin):
             sample_cand_token = batch_cand_tokens[b]
             sample_ret_score = ret_scores[b]
             sample_candidate_mask = candidate_mask[b]
-            sample_teacher_conf = sum_cand_logps[b]
+            if sum_cand_logps is not None:
+                sample_teacher_conf = sum_cand_logps[b]
+            else:
+                sample_teacher_conf = None
 
             cand_tokens, logw, merged_score = merge_candidates_with_temperature(
                 cand_tokens=sample_cand_token,
@@ -727,7 +731,8 @@ class WrappedLM(nn.Module, GenerationMixin):
 
         kd_losses = torch.stack(kd_losses, dim=0)  # [B]
         ce_losses = torch.stack(ce_losses, dim=0)
-        ft_kl_losses= torch.stack(ft_kl_losses, dim=0)
+        if add_kl:
+            ft_kl_losses= torch.stack(ft_kl_losses, dim=0)
         if reduction == "none":
             if add_kl:
                 return kd_losses, ce_losses, ft_kl_losses

@@ -6,12 +6,13 @@ p.add_argument("--top_k", type=int, default=20)
 p.add_argument("--ce_weight", type=float, default=1.)
 p.add_argument("--kd_weight", type=float, default=0.5)
 p.add_argument("--lr", type=float, default=1e-5)
+p.add_argument("--device", type=str, default="0,1")
 p.add_argument("--no_tea", action="store_true")
 args = p.parse_args()
 
 import os
 #os.environ['HF_HOME'] = '/data_external/hf_cache'
-os.environ['CUDA_VISIBLE_DEVICES']="0,1"
+os.environ['CUDA_VISIBLE_DEVICES']=args.device
 os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
 os.environ['HF_HUB_OFFLINE'] = "1" 
 
@@ -169,7 +170,7 @@ def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerato
         # logits_flat = shift_logits[shift_label_mask]         # [N_tokens, V]
         if args.no_tea:
             sum_cand_logps = None
-        kd_loss, ce_loss, ft_kl_loss = model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, m_first_tok_id=m_first_tok_id, m_first_tok_logp=m_first_tok_logp, m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train", mode=mode, add_kl=False)
+        kd_loss, ce_loss= model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, m_first_tok_id=m_first_tok_id, m_first_tok_logp=m_first_tok_logp, m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train", mode=mode, add_kl=False)
 
         loss = kd_loss*KD_WEIGHT + ce_loss * ALPHA_CE# + ft_kl_loss*KL_WEIGHT
         #loss = ce_loss
