@@ -615,7 +615,7 @@ def main():
     # print(next(memory.parameters()).device)
     # print(sum(p.numel() for p in memory.parameters()) / 1e9, "B params")
 
-    # saved_dict = torch.load('/data_external/video/codes/MPM/checkpoints/step6000_ce_kd.pt')
+    # saved_dict = torch.load('/data_external/video/codes/MPM/checkpoints/kd_05_k30_t05.pt')
     # memory.load_state_dict(saved_dict, strict=True)
 
     model = WrappedLM(base_model, memory, config=base_model.config, processor=processor, layer_idx_for_mem=HID_LAYER_ID)
@@ -883,8 +883,8 @@ def main():
                 torch.cuda.empty_cache()
 
             if step%3000 == 0 and step != 0:
-                #accel.wait_for_everyone()
-                #state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
+                accel.wait_for_everyone()
+                state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
                 if accel.is_main_process:
                     torch.save(state, f"/data_external/video/code/MPM/checkpoints/ep{ep}step{step}_ce_kd_{args.device}.pt")
 

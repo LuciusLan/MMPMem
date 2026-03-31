@@ -3,7 +3,7 @@ import os, json, math, argparse
 
 #os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ['CUDA_VISIBLE_DEVICES']="1"
-os.environ["HF_HOME"]='/data_external/hf_cache'
+#os.environ["HF_HOME"]='/data_external/hf_cache'
 #os.environ['VLLM_FLASH_ATTN_VERSION']="2"
 os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
 # os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -45,17 +45,17 @@ def set_determinism(seed):
 set_determinism(2026)
 
 mcq_keys = ['A', 'B', 'C', 'D']
-test_ds = datasets.load_from_disk('/data_external/MRAG')
+test_ds = datasets.load_from_disk('/data_external/video/datasets/MPM/evqa_test')
 
 test_ds:HFDataset = datasets.concatenate_datasets([test_ds['train'], test_ds['test']])
 test_ds = test_ds.cast_column('image', HFImage(decode=True))
 
-processor= Qwen3VLProcessor.from_pretrained('/wyy/models/Qwen3-VL-8B-Instruct')
-base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
+processor= Qwen3VLProcessor.from_pretrained('/data_external/video/models/Qwen3-VL-8B-Instruct')
+base_model = Qwen3VLForConditionalGeneration.from_pretrained("/data_external/video/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
 
 memory = MemoryMLP()
 memory = memory.to('cuda')
-saved_dict = torch.load('/data_external/MMPMem/checkpoints/kd_eq_weight_k30_t07.pt')
+saved_dict = torch.load('/data_external/video/codes/MPM/checkpoints/kd_eq_weight_k30_t07.pt')
 memory.load_state_dict(saved_dict, strict=True)
 
 model = WrappedLM(base_model, memory, config=base_model.config, processor=processor, layer_idx_for_mem=-1)
