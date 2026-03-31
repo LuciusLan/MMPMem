@@ -47,8 +47,8 @@ set_determinism(2026)
 mcq_keys = ['A', 'B', 'C', 'D']
 test_ds = datasets.load_from_disk('/data_external/video/datasets/MPM/evqa_test')
 
-test_ds:HFDataset = datasets.concatenate_datasets([test_ds['train'], test_ds['test']])
-test_ds = test_ds.cast_column('image', HFImage(decode=True))
+#test_ds:HFDataset = datasets.concatenate_datasets([test_ds['train'], test_ds['test']])
+#test_ds = test_ds.cast_column('image', HFImage(decode=True))
 
 processor= Qwen3VLProcessor.from_pretrained('/data_external/video/models/Qwen3-VL-8B-Instruct')
 base_model = Qwen3VLForConditionalGeneration.from_pretrained("/data_external/video/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
@@ -78,7 +78,8 @@ def process_prompt(inputs):
                         "image": inputs['image'],
                     },
                     #{"type": "text", "text": "Please answer the image related multiple choice question. Be concise, output the answer only, without any additional words.\n" + "\nQuestion: " +question},
-                    {"type": "text", "text": "Please answer the image related multiple choice question.\nPlease output your selection WITHOUT the option letter. (e.g. If you select answer \"A: panda\", output only \"panda\")\n" + "\nQuestion: " +question},
+                    #{"type": "text", "text": "Please answer the image related multiple choice question.\nPlease output your selection WITHOUT the option letter. (e.g. If you select answer \"A: panda\", output only \"panda\")\n" + "\nQuestion: " +question},
+                    {"type": "text", "text": "Please answer the image related question. Make your answer concise, directly output the answer.\n" + "\nQuestion: " + question},
                 ],
             }
         ]
@@ -147,6 +148,7 @@ cb=0
 
 pbar = tqdm(total=len(test_ds))
 pm_wrong= []
+pred_file = open('/data_external/video/codes/MPM/evqa_pred.txt', 'w')
 for step,row in enumerate(test_ds):
     inputs = process_prompt(row)
     inputs = inputs.to('cuda')
@@ -156,6 +158,7 @@ for step,row in enumerate(test_ds):
         generated_ids = output_ids[:, input_len:]
         text = processor.decode(generated_ids, skip_special_tokens=True)[0]
         #gid, _, text_base = generate_with_memory(model, memory, processor.tokenizer, inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=1.)
+        pred_file.write(f"{text}<s>{row['answer']}")
     
 
     # try:
@@ -163,11 +166,11 @@ for step,row in enumerate(test_ds):
     #     pred = pred.groups()[0]
     # except:
     #     pred = ""
-    if row['answer_choice'].lower() in text.lower() or row['answer'].lower() in text.lower():
-        cm +=1
-        mm_corect = True
-    else:
-        mm_correct = False
+    # if row['answer_choice'].lower() in text.lower() or row['answer'].lower() in text.lower():
+    #     cm +=1
+    #     mm_corect = True
+    # else:
+    #     mm_correct = False
     
     # try:
     #     pred_base = re.search(r'\\boxed\{(.+)\}', text_base.lower(), re.DOTALL)
@@ -187,12 +190,12 @@ for step,row in enumerate(test_ds):
     #pbar.set_postfix({'BaseLM ACC': 100*(cb/(1+step)), 'PMM ACC':  100*(cm/(1+step))})
 
     # MPM Best 68.07
-print('base')
-print(100*(cb/len(test_ds)))
-print()
+# print('base')
+# print(100*(cb/len(test_ds)))
+# print()
 
-print('mix')
-print(100*(cm/len(test_ds)))
+# print('mix')
+# print(100*(cm/len(test_ds)))
 
 pass
 
