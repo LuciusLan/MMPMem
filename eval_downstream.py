@@ -55,10 +55,10 @@ base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-
 
 memory = MemoryMLP()
 memory = memory.to('cuda')
-saved_dict = torch.load('/data_external/MMPMem/checkpoints/t1.0_k20_skd_lr1e-06.pt')
+saved_dict = torch.load('/data_external/MMPMem/checkpoints/kd_eq_weight_k30_t07.pt')
 memory.load_state_dict(saved_dict, strict=True)
 
-model = WrappedLM(base_model, memory, config=base_model.config, processor=processor, layer_idx_for_mem=32)
+model = WrappedLM(base_model, memory, config=base_model.config, processor=processor, layer_idx_for_mem=-1)
 
 
 
@@ -102,15 +102,56 @@ def process_prompt(inputs):
 
 cm =0
 cb=0
+
+# pbar = tqdm(total=len(test_ds))
+# pm_wrong= []
+# mm_corect= False
+# base_correct = False
+# for step,row in enumerate(test_ds):
+#     inputs = process_prompt(row)
+#     inputs = inputs.to('cuda')
+#     with torch.inference_mode():
+#         output_ids = model.generate(**inputs, mix_mode='base', mix_lambda=0.5, branch="generation")
+#         input_len = inputs.input_ids.size(1)
+#         generated_ids = output_ids[:, input_len:]
+#         text = processor.decode(generated_ids, skip_special_tokens=True)[0]
+#         #gid, _, text_base = generate_with_memory(model, memory, processor.tokenizer, inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=1.)
+    
+
+#     # try:
+#     #     pred = re.search(r'\\boxed\{(.+)\}', text.lower(), re.DOTALL)
+#     #     pred = pred.groups()[0]
+#     # except:
+#     #     pred = ""
+#     if row['answer_choice'].lower() in text.lower() or row['answer'].lower() in text.lower():
+#         cb +=1
+#         mm_corect = True
+#     else:
+#         mm_correct = False
+    
+    # try:
+    #     pred_base = re.search(r'\\boxed\{(.+)\}', text_base.lower(), re.DOTALL)
+    #     pred_base = pred_base.groups()[0]
+    # except:
+    #     pred_base = text_base
+    # if row['answer_choice'].lower() in pred_base.lower() or row['answer'].lower() in text_base.lower():
+    #     cb +=1
+    #     base_correct = True
+    # else:
+    #     base_correct = False
+    
+    # if base_correct and not mm_corect:
+    #     pm_wrong.append([row['answer_choice'], text, text_base])
+
+    #pbar.update()
+
 pbar = tqdm(total=len(test_ds))
 pm_wrong= []
-mm_corect= False
-base_correct = False
 for step,row in enumerate(test_ds):
     inputs = process_prompt(row)
     inputs = inputs.to('cuda')
     with torch.inference_mode():
-        output_ids = model.generate(**inputs, mix_mode='mix', mix_lambda=0.65, branch="generation")
+        output_ids = model.generate(**inputs, mix_mode='mix', mix_lambda=0.8, branch="generation")
         input_len = inputs.input_ids.size(1)
         generated_ids = output_ids[:, input_len:]
         text = processor.decode(generated_ids, skip_special_tokens=True)[0]
@@ -143,10 +184,15 @@ for step,row in enumerate(test_ds):
     #     pm_wrong.append([row['answer_choice'], text, text_base])
 
     pbar.update()
-    pbar.set_postfix({'BaseLM ACC': 100*(cb/(1+step)), 'PMM ACC':  100*(cm/(1+step))})
+    #pbar.set_postfix({'BaseLM ACC': 100*(cb/(1+step)), 'PMM ACC':  100*(cm/(1+step))})
 
     # MPM Best 68.07
-print(100*(cm/(1+step)))
+print('base')
+print(100*(cb/len(test_ds)))
+print()
+
+print('mix')
+print(100*(cm/len(test_ds)))
 
 pass
 

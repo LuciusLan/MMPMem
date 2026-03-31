@@ -6,8 +6,9 @@ import copy
 
 import torch
 import torch.nn.functional as F
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
 
+LegacyPast = Tuple[Tuple[torch.Tensor, ...], ...]
 
 # ----------------------------
 # Masking utilities
@@ -94,6 +95,144 @@ def extract_top1_sequences_and_logp(
 # Helper: repeat/copy DynamicCache across a batch
 # ----------------------------
 
+def clone_past_key_values(
+    past_key_values: Union[None, LegacyPast, Cache],
+    *,
+    model_config: Optional[Any] = None,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> Union[None, LegacyPast, Cache]:
+    """
+    Clone Hugging Face `past_key_values` so that all underlying tensors have new storage
+    (via `Tensor.clone()`), preventing any in-place edits from affecting the original.
+
+    Supports:
+      - Legacy tuple-of-tuples caches (each entry typically (k, v) or similar)
+      - v5 `Cache` objects: DynamicCache, StaticCache, EncoderDecoderCache
+
+    Notes:
+      - For StaticCache, `model_config` is required to construct a new StaticCache instance. :contentReference[oaicite:1]{index=1}
+      - `device` / `dtype` optionally move/cast the cloned tensors.
+
+    Returns:
+      A cloned cache of the same general type (legacy vs Cache).
+    """
+
+    def _clone_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if t is None:
+            return None
+        out = t.clone()
+        if device is not None or dtype is not None:
+            out = out.to(device=device or out.device, dtype=dtype or out.dtype)
+        return out
+
+    if past_key_values is None:
+        return None
+
+    # 1) Legacy tuple-of-tuples (works for many older models / compatibility paths)
+    if isinstance(past_key_values, tuple):
+        return tuple(tuple(_clone_tensor(x) for x in layer) for layer in past_key_values)  # type: ignore[return-value]
+
+    # 2) Encoder-decoder wrapper cache (holds two Cache objects)
+    # if isinstance(past_key_values, EncoderDecoderCache):
+    #     self_c = clone_past_key_values(
+    #         past_key_values.self_attention_cache,
+    #         model_config=model_config,
+    #         device=device,
+    #         dtype=dtype,
+    #     )
+    #     cross_c = clone_past_key_values(
+    #         past_key_values.cross_attention_cache,
+    #         model_config=model_config,
+    #         device=device,
+    #         dtype=dtype,
+    #     )
+    #     # Constructor accepts (self_cache, cross_cache). :contentReference[oaicite:2]{index=2}
+    #     return EncoderDecoderCache(self_c, cross_c)  # type: ignore[arg-type]
+
+    # 3) DynamicCache: rebuild via ddp_cache_data using the cache iterator
+    if isinstance(past_key_values, DynamicCache):
+        ddp_cache_data = []
+        for entry in past_key_values:
+            # entry is (keys, values, optional_sliding_window_tensor) for DynamicCache. :contentReference[oaicite:3]{index=3}
+            cloned = tuple(_clone_tensor(x) for x in entry)
+            # Keep arity (2 or 3) exactly as yielded
+            ddp_cache_data.append(cloned)
+
+        # Preserve offloading flags if present (Cache stores offloading config). :contentReference[oaicite:4]{index=4}
+        offloading = getattr(past_key_values, "offloading", False)
+        only_non_sliding = getattr(past_key_values, "only_non_sliding", False)
+        return DynamicCache(
+            ddp_cache_data=ddp_cache_data,
+            config=model_config,
+            offloading=offloading,
+            offload_only_non_sliding=only_non_sliding,
+        )
+
+    # 4) StaticCache: construct a fresh cache then copy tensor contents
+    if isinstance(past_key_values, StaticCache):
+        if model_config is None:
+            raise ValueError("clone_past_key_values: `model_config` is required to clone a StaticCache.")
+
+        offloading = getattr(past_key_values, "offloading", False)
+        only_non_sliding = getattr(past_key_values, "only_non_sliding", True)
+
+        new_cache = StaticCache(
+            config=model_config,
+            max_cache_len=past_key_values.max_cache_len,
+            offloading=offloading,
+            offload_only_non_sliding=only_non_sliding,
+        )
+
+        # Copy per-layer buffers (keys/values and any length trackers) without sharing storage.
+        # Static layers allocate lazily; ensure initialized before copying.
+        for src_layer, dst_layer in zip(past_key_values.layers, new_cache.layers):
+            if not getattr(src_layer, "is_initialized", False):
+                continue
+
+            # Initialize destination layer on the correct device/dtype
+            # by calling its lazy initializer with a small slice.
+            k_src = src_layer.keys
+            v_src = src_layer.values
+            if k_src is None or v_src is None:
+                continue
+
+            k1 = k_src[:, :, :1, :] if k_src.shape[-2] > 0 else k_src
+            v1 = v_src[:, :, :1, :] if v_src.shape[-2] > 0 else v_src
+
+            # If empty (edge case), still allocate by using the original tensors directly.
+            k_init = _clone_tensor(k1)
+            v_init = _clone_tensor(v1)
+
+            dst_layer.lazy_initialization(k_init, v_init)
+
+            # Copy full content
+            dst_layer.keys.copy_(_clone_tensor(k_src))
+            dst_layer.values.copy_(_clone_tensor(v_src))
+
+            # Copy cumulative length trackers *in-place* when they are tensors.
+            if hasattr(dst_layer, "cumulative_length") and hasattr(src_layer, "cumulative_length"):
+                if isinstance(dst_layer.cumulative_length, torch.Tensor):
+                    dst_layer.cumulative_length.copy_(_clone_tensor(src_layer.cumulative_length))
+                else:
+                    dst_layer.cumulative_length = int(src_layer.cumulative_length)
+
+            if hasattr(dst_layer, "cumulative_length_int") and hasattr(src_layer, "cumulative_length_int"):
+                dst_layer.cumulative_length_int = int(src_layer.cumulative_length_int)
+
+            if hasattr(dst_layer, "_sliding_window_tensor") and hasattr(src_layer, "_sliding_window_tensor"):
+                # Some sliding layers store this tensor; keep it consistent.
+                dst_layer._sliding_window_tensor = _clone_tensor(src_layer._sliding_window_tensor)
+
+        return new_cache
+
+    # 5) Other Cache subclasses (e.g., quantized caches) exist; their constructors carry extra hyperparameters.
+    # For those, a safe default is to fall back to Python deepcopy, but your request was explicit about clone().
+    raise NotImplementedError(
+        f"clone_past_key_values: unsupported Cache subclass {type(past_key_values)}. "
+        "Implement a dedicated branch for this cache type (e.g., QuantizedCache) if needed."
+    )
+
 def _repeat_dynamic_cache(base_cache: Union[Any,DynamicCache], repeat: int) -> Any:
     """
     Create a new DynamicCache with batch dimension repeated.
@@ -107,7 +246,8 @@ def _repeat_dynamic_cache(base_cache: Union[Any,DynamicCache], repeat: int) -> A
     if DynamicCache is None:
         raise RuntimeError("DynamicCache is not available; install a recent transformers version.")
 
-    new_cache = copy.deepcopy(base_cache)
+    #new_cache = copy.deepcopy(base_cache)
+    new_cache = clone_past_key_values(base_cache)
     new_cache.batch_repeat_interleave(repeat)
     #new_cache = None
 
@@ -727,6 +867,7 @@ def seq_kd_loss_from_seq_logp(
     *,
     candidate_mask: Optional[torch.Tensor] = None,
     reduction: Literal["mean", "sum", "none"] = "mean",
+    kl_mode=False
 ) -> torch.Tensor:
     """
     seq-KD in sequence form (sum-of-logs expectation):
@@ -749,7 +890,21 @@ def seq_kd_loss_from_seq_logp(
     lw = logw.masked_fill(~candidate_mask, float("-inf"))
     w_norm = torch.softmax(lw, dim=1)  # [B, K]
 
+    if kl_mode:
+        student_seq_logp = student_seq_logp.log_softmax(-1)
+
+        target_logp = torch.log_softmax(lw, dim=-1)
+        target_p = target_logp.exp()
+
+        ce = -(target_p * student_seq_logp).sum(dim=-1)
+        entropy = -(target_p * target_logp).sum(dim=-1)
+        kl = ce - entropy
+
+        return kl.sum()
+
     per_ex = -(w_norm * student_seq_logp).sum(dim=1)  # [B]
+
+
 
     if reduction == "none":
         return per_ex

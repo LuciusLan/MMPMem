@@ -64,7 +64,7 @@ KL_WEIGHT = 0.3
 USE_RESIDUAL = False       # if True: memory learns residual logits; else memory outputs a dist directly
 HID_LAYER_ID = -1
 EPS = 1e-12
-MACRO_BATCH_SIZE = 20
+MACRO_BATCH_SIZE = 8
 LR = args.lr
 
 # =========================
@@ -169,7 +169,7 @@ def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerato
         # gold_flat = shift_labels[shift_label_mask]               # [N_tokens]
         # logits_flat = shift_logits[shift_label_mask]         # [N_tokens, V]
 
-        kd_loss, ce_loss, valid = model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, m_first_tok_id=m_first_tok_id, m_first_tok_logp=m_first_tok_logp, m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train", mode=mode, add_kl=False)
+        kd_loss, ce_loss, valid = model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, m_first_tok_id=m_first_tok_id, m_first_tok_logp=m_first_tok_logp, m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train", mode=mode, add_kl=False, train_base=True)
 
         loss = kd_loss*KD_WEIGHT + ce_loss * ALPHA_CE# + ft_kl_loss*KL_WEIGHT
         #loss = ce_loss
@@ -595,7 +595,10 @@ def main():
 
     #train_ds = train_ds.cast_column("image", HFImage(decode=True))
     #train_ds = train_ds.select(range(100000))
-    test_ds = datasets.load_from_disk('/data_external/video/datasets/MPM/val_combined').with_format('torch')
+    test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_combined').with_format('torch')
+    #test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_full').with_format('torch')
+    #test_ds = test_ds.filter(lambda x: x['utype'] == 'val_unseen_entity') #val_unseen_question
+    #test_ds = test_ds.select(range(5000))
 
     base_model = Qwen3VLForConditionalGeneration.from_pretrained("/data_external/video/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
 
@@ -606,11 +609,11 @@ def main():
     processor = AutoProcessor.from_pretrained('/data_external/video/models/Qwen3-VL-8B-Instruct')
 
     memory = MemoryMLP()
-    for p in memory.parameters():
-        p.requires_grad_(True)
+    # for p in memory.parameters():
+    #     p.requires_grad_(True)
 
-    print(next(memory.parameters()).device)
-    print(sum(p.numel() for p in memory.parameters()) / 1e9, "B params")
+    # print(next(memory.parameters()).device)
+    # print(sum(p.numel() for p in memory.parameters()) / 1e9, "B params")
 
     # saved_dict = torch.load('/data_external/video/codes/MPM/checkpoints/step6000_ce_kd.pt')
     # memory.load_state_dict(saved_dict, strict=True)
@@ -699,7 +702,7 @@ def main():
     #     stats.append([has_correct, rank])
     #     pass
     #train_dl.__iter__().__next__()
-    test_dl = DataLoader(test_ds, batch_size=1, collate_fn=collate_eval)
+    test_dl = DataLoader(test_ds, batch_size=4, collate_fn=collate_eval,) #num_workers=5, prefetch_factor=2,)
 
     
     num_warmup_steps = 200
@@ -723,7 +726,7 @@ def main():
         find_unused_parameters=True,
         static_graph=False,
     )
-    accel = Accelerator(kwargs_handlers=[ddp])
+    accel = Accelerator(kwargs_handlers=[ddp], gradient_accumulation_steps=2)
     model, optimizer,scheduler, train_dl, test_dl = accel.prepare(model, optimizer, scheduler, train_dl, test_dl)
 
     unw_model = accel.unwrap_model(model)
@@ -776,59 +779,64 @@ def main():
     #     gathered_results_base.sort(key=lambda x: x["data_id"])
     #     print(correct)
     #     wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
-    # accel.wait_for_everyone()
+    accel.wait_for_everyone()
 
     # correct = torch.tensor(0., device=model.device)
     # gathered_results_mix = []
-    # with torch.inference_mode(), accel.join_uneven_inputs([model], even_batches=False):
-    #     for row in tqdm(test_dl):
-    #         inputs, gts, data_ids = row
-    #         output_ids = unw_model.generate(**inputs, mix_mode='mix', mix_lambda=0.6, branch="generation")
-    #         input_len = inputs.input_ids.size(1)
-    #         generated_ids = output_ids[:, input_len:]
-    #         text = processor.batch_decode(generated_ids, skip_special_tokens=True)
+    # print('UE')
+    # with torch.inference_mode():
+    #     for lam in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+    #         correct = torch.tensor(0., device=model.device)
+    #         for row in tqdm(test_dl):
+    #             inputs, gts, data_ids = row
+    #             output_ids = unw_model.generate(**inputs, mix_mode='mix', mix_lambda=lam, branch="generation")
+    #             input_len = inputs.input_ids.size(1)
+    #             generated_ids = output_ids[:, input_len:]
+    #             text = processor.batch_decode(generated_ids, skip_special_tokens=True)
 
-    #         local_results = []
-    #         for gt, pred, did in zip(gts, text, data_ids):
-    #             if '{' in gt[0] and '}' in gt[0]:
-    #                 gt = ast.literal_eval(gt[0])
-    #             score_m = score_infoseek(pred, gt)
-    #             correct += score_m['acc']
-    #             local_results.append({"c": 1 if score_m['acc']>0 else 0, "data_id": did, 'gt': gt, 'pred': pred})
+    #             local_results = []
+    #             for gt, pred, did in zip(gts, text, data_ids):
+    #                 if '{' in gt[0] and '}' in gt[0]:
+    #                     gt = ast.literal_eval(gt[0])
+    #                 score_m = score_infoseek(pred, gt)
+    #                 correct += score_m['acc']
+    #                 local_results.append({"score": 1 if score_m['acc']>0 else 0, "data_id": did, 'gt': gt, 'pred': pred})
 
-    #         gathered = accel.gather_for_metrics(
-    #             local_results,
-    #             use_gather_object=True,
-    #         )
+    #             # gathered = accel.gather_for_metrics(
+    #             #     local_results,
+    #             #     use_gather_object=True,
+    #             # )
+    #             # if accel.is_main_process:
+    #             #     # Normalize in case the gathered structure is nested by rank
+    #             #     if len(gathered) > 0 and isinstance(gathered[0], list):
+    #             #         gathered = [x for chunk in gathered for x in chunk]
+    #             #     gathered_results_mix.extend(gathered)
+
+    #         accel.wait_for_everyone()
+    #         correct = accel.reduce(correct, reduction="sum")
     #         if accel.is_main_process:
-    #             # Normalize in case the gathered structure is nested by rank
-    #             if len(gathered) > 0 and isinstance(gathered[0], list):
-    #                 gathered = [x for chunk in gathered for x in chunk]
-    #             gathered_results_mix.extend(gathered)
-
-    # accel.wait_for_everyone()
-    # correct = accel.reduce(correct, reduction="sum")
-    # if accel.is_main_process:
-    #     correct = correct.item()
-    #     gathered_results_mix.sort(key=lambda x: x["data_id"])
-    #     print(correct)
-    #     #wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
-    # accel.wait_for_everyone()
-
+    #             correct = correct.item()
+    #             gathered_results_mix.sort(key=lambda x: x["data_id"])
+    #             print(f'Lambda: {lam}')
+    #             print(correct)
+    #             print(correct / len(test_ds))
+    #             print()
+    #             #wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
+    #         accel.wait_for_everyone()
+    #torch.save(gathered_results_mix, "/latent_aug/MMPMem/best_result_base_ue.pt")
+    #return
     # torch.save([gathered_results_base, gathered_results_mix], "/latent_aug/MMPMem/result_analy_ue.pt")
 
     # unseen question 
-    # base 21.92
-    # mix 0.6 21.77
-    # Mix 0.6 LMLast 22.24
+    # base 21.950
+    # Mix best 22.883
 
     # 7512, 296
     # 264, 1928
 
     # unseen entity 
-    # base  18.78
-    # mix 0.6 18.69
-    # Mix 0.6 LMLast 19.02
+    # base  19.525
+    # Mix best 19.591
     #         # Top 30:
     #         # 4706/10000 has GT answer in candidates
     #         # average marginalized weight for GT answer in candidates: 45.54%
@@ -871,12 +879,12 @@ def main():
                     "train/current_lr": scheduler.get_last_lr()[0],
                 }
                 wandb_run.log(log_dict)
-            if step%20 == 0:
+            if step%10 == 0:
                 torch.cuda.empty_cache()
 
-            if step%2000 == 0 and step != 0:
-                accel.wait_for_everyone()
-                state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
+            if step%3000 == 0 and step != 0:
+                #accel.wait_for_everyone()
+                #state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
                 if accel.is_main_process:
                     torch.save(state, f"/data_external/video/code/MPM/checkpoints/ep{ep}step{step}_ce_kd_{args.device}.pt")
 
@@ -886,6 +894,7 @@ def main():
                 em = 0
                 cb = torch.tensor(0., device=model.device)
                 eb = 0
+                test_step = 0
                 for row in tqdm(test_dl):
                     inputs, gts, data_ids = row
                     with torch.inference_mode():
@@ -899,6 +908,9 @@ def main():
                             gt = ast.literal_eval(gt[0])
                         score_m = score_infoseek(pred, gt)
                         correct += score_m['acc']
+                    test_step +=1
+                    if test_step%10 == 0:
+                        torch.cuda.empty_cache()
                 model.train()
                 print(f"Ep {ep}: val acc: {correct/1000} | val em: {em/1000}")
                 accel.wait_for_everyone()
@@ -908,7 +920,7 @@ def main():
                     wandb_run.log({'eval/acc': correct/1000})
 
         accel.wait_for_everyone()
-        state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
+        #state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
         if accel.is_main_process:
             torch.save(state, f"/data_external/video/code/MPM/checkpoints/{ep}_ce_kd_{args.device}.pt")
         accel.wait_for_everyone()

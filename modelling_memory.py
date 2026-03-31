@@ -5,14 +5,14 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.generation import GenerationMixin
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, is_torchdynamo_compiling
 from transformers import Qwen3VLForConditionalGeneration
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLCausalLMOutputWithPast, Qwen3VLModelOutputWithPast
 
-from seq_kd_utils import _slice_text_batch_to_single, _split_visual_inputs_qwen3vl_by_sample, _compact_right_pad_or_left_pad, token_mask_right_padded, _repeat_dynamic_cache, build_prompt_only_masks, merge_candidates_with_temperature, marginalize_first_token_logp_topk, trim_excess_right_padding, seq_kd_loss_from_seq_logp, mml_loss_from_seq_logp, sparse_kl_with_tail
+from seq_kd_utils import _slice_text_batch_to_single, _split_visual_inputs_qwen3vl_by_sample, _compact_right_pad_or_left_pad, token_mask_right_padded, _repeat_dynamic_cache, build_prompt_only_masks, merge_candidates_with_temperature, marginalize_first_token_logp_topk, trim_excess_right_padding, seq_kd_loss_from_seq_logp, mml_loss_from_seq_logp, sparse_kl_with_tail, clone_past_key_values
 
 class Qwen3VLCausalLMOutputWithPast_Pos(Qwen3VLCausalLMOutputWithPast):
     def __init__(self, *args, **kwargs):
@@ -73,7 +73,7 @@ class MemoryMLP(nn.Module):
         if head == 'dense':
             self.head = nn.Linear(d_in, vocab_size, bias=False)
             #nn.init.zeros_(self.head.bias)
-            nn.init.zeros_(self.head.weight)
+            nn.init.kaiming_normal_(self.head.weight)
         elif head == 'factorized':
             self.proj = nn.Linear(d_in, head_rank, bias=False)
             self.out = nn.Linear(head_rank, vocab_size, bias=True)
@@ -147,8 +147,8 @@ class WrappedLM(nn.Module, GenerationMixin):
             #model_kwargs["position_ids"] = outputs.position_ids
             next_position_id =  outputs.position_ids.clone()
             next_position_id = next_position_id[:,:,-1] +1
-            next_position_id = next_position_id.unsqueeze(1)
-            model_kwargs["position_ids"] = next_position_id
+            next_position_id = next_position_id.unsqueeze(-1)
+            model_kwargs["position_ids"] = torch.cat([outputs.position_ids.clone(), next_position_id], dim=-1)
 
         return model_kwargs
     
@@ -270,7 +270,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
 
         if mix_mode == 'base':
-            base_logits = self.lm_head(last_hidden_states[:, slice_indices, :])
+            base_logits = self.base_lm.lm_head(last_hidden_states[:, slice_indices, :])
             logits = base_logits
         elif mix_mode == 'mem':
             memory_logits = self.memory(hidden_state_for_mem[:, slice_indices, :])
@@ -313,6 +313,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         include_eos: bool = True,
         length_norm: Literal["none", "mean"] = "mean",
         detach_prompt_cache: bool = False,
+        train_base=False
     ) -> tuple[torch.Tensor, Cache, torch.Tensor, torch.Tensor] :
         """
         Computes log p_S(y | original prompt for sample_index) for each candidate sequence y.
@@ -373,14 +374,14 @@ class WrappedLM(nn.Module, GenerationMixin):
 
         # ---- 1) Prompt forward pass (single example) to get last-token logits and a DynamicCache ----
         base_cache = DynamicCache()
-
+        MIX_MODE = 'base' if train_base else 'mem'
         try:
             out_prompt = self.forward_basic(
                 **single,
                 past_key_values=base_cache,
                 use_cache=True,
                 return_dict=True,
-                mix_mode='mem'
+                mix_mode=MIX_MODE
             )
         except TypeError:
             # Some versions initialize DynamicCache internally if not passed
@@ -388,11 +389,11 @@ class WrappedLM(nn.Module, GenerationMixin):
                 **single,
                 use_cache=True,
                 return_dict=True,
-                mix_mode='mem'
+                mix_mode=MIX_MODE
             )
 
         prompt_logits_last = out_prompt.logits[:, -1, :]  # [1, V]
-        prompt_cache = out_prompt.past_key_values         # DynamicCache
+        prompt_cache:DynamicCache = out_prompt.past_key_values         # DynamicCache
 
         if detach_prompt_cache:
             try:
@@ -418,9 +419,10 @@ class WrappedLM(nn.Module, GenerationMixin):
 
         student_seq_logp = cand_tokens.new_zeros((K,), dtype=torch.float32)
         prefix_len = prompt_cache.get_seq_length()
-
-        prompt_cache_clone = copy.deepcopy(prompt_cache)
-        prompt_cache_return =  copy.deepcopy(prompt_cache)
+        #prompt_cache_clone = copy.deepcopy(prompt_cache)
+        prompt_cache_clone = clone_past_key_values(prompt_cache)
+        #prompt_cache_return =  copy.deepcopy(prompt_cache)
+        prompt_cache_return = clone_past_key_values(prompt_cache)
         for start in range(0, K, chunk_size):
             end = min(K, start + chunk_size)
             n = end - start
@@ -461,7 +463,7 @@ class WrappedLM(nn.Module, GenerationMixin):
                 cache_position=suffix_cache_position,
                 use_cache=False,
                 return_dict=True,
-                mix_mode='mem'
+                mix_mode=MIX_MODE
             )
 
             logits = out_ans.logits  # [n, L, V]
@@ -510,6 +512,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         # options
         reduction: Literal["mean", "sum"] = "mean",
         length_norm: Literal["none", "mean"] = "mean",
+        train_base=False
     ) -> torch.Tensor:
         """
         Computes teacher-forced CE over target (labels != -100) tokens using cached prefix.
@@ -537,7 +540,8 @@ class WrappedLM(nn.Module, GenerationMixin):
 
         # 2) Score remaining tokens by continuing from prefix_cache
         # Note: passing past_key_values may mutate it; clone defensively.
-        cache = copy.deepcopy(prefix_cache)
+        #cache = copy.deepcopy(prefix_cache)
+        cache = clone_past_key_values(prefix_cache)
 
         # Build attention mask for the continuation. With past, most HF models accept either:
         #   - full mask of length prefix_len + L
@@ -550,13 +554,14 @@ class WrappedLM(nn.Module, GenerationMixin):
         full_attn = torch.cat([prefix_attn, ans_attn], dim=1)  # [1, prefix_len + L]
 
         # Forward on the full answer segment tokens. We will use logits[:, :-1] to score ans_ids[:, 1:].
+        MIX_MODE = "base" if train_base else "mem"
         out = self.forward_basic(
             input_ids=ans_ids_1,
             attention_mask=full_attn,
             position_ids=suffix_position_ids,
             cache_position=suffix_cache_position,
             past_key_values=cache,
-            mix_mode="mem",
+            mix_mode=MIX_MODE,
             use_cache=True,
             return_dict=True,
         )
@@ -602,6 +607,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         detach_prompt_cache: bool = False,
         # reduction
         reduction: Literal["mean", "sum", "none"] = "mean",
+        train_base=False,
     ) -> torch.Tensor:
         """
         Same semantics as the previous version, but:
@@ -684,6 +690,7 @@ class WrappedLM(nn.Module, GenerationMixin):
                 include_eos=True,
                 length_norm=student_length_norm,
                 detach_prompt_cache=detach_prompt_cache,
+                train_base=train_base
             )  # [K']
 
             prefix_len = prompt_cache_return.get_seq_length()
@@ -704,6 +711,7 @@ class WrappedLM(nn.Module, GenerationMixin):
                 suffix_cache_position=suffix_cache_position,
                 prefix_cache=prompt_cache_return,
                 logp_first_dist=logp_first_dist,
+                train_base=train_base,
                 )
             
             if logw.size(0) > 1:
@@ -727,7 +735,16 @@ class WrappedLM(nn.Module, GenerationMixin):
                         reduction="none",
                     ).squeeze(0)
                 elif mode == 'listkl':
-                    loss_b = listwise_kl_loss(student_seq_logp, merged_score)
+                    loss_b = seq_kd_loss_from_seq_logp(
+                        student_seq_logp=student_seq_logp.unsqueeze(0),
+                        logw=logw.unsqueeze(0),
+                        candidate_mask=None,
+                        reduction="none",
+                        kl_mode=True
+                    )#.squeeze(0)
+
+                    #loss_b = F.kl_div(student_seq_logp.unsqueeze(0).softmax(-1), merged_score.unsqueeze(0), reduction="sum")
+                    pass
                 else:
                     raise ValueError(f"Unknown mode: {mode}")
 
@@ -740,7 +757,7 @@ class WrappedLM(nn.Module, GenerationMixin):
 
 
         ce_losses = torch.stack(ce_losses, dim=0)
-        ce_losses = ce_losses * valid_mask # Scale CE Loss for samples having only one merged candidate
+        #ce_losses = ce_losses * valid_mask # Scale CE Loss for samples having only one merged candidate
 
         if len(kd_losses) > 0:
             kd_losses = torch.stack(kd_losses, dim=0)  # [B]
@@ -804,6 +821,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         add_kl=False,
 
         branch=None,
+        train_base=False,
         **kwargs: Unpack[TransformersKwargs],):
         if branch == "generation":
             if position_ids.size(0) != 4 or len(position_ids.shape) != 3:
@@ -826,7 +844,7 @@ class WrappedLM(nn.Module, GenerationMixin):
                 mode = "mml"
             out = self.compute_loss_premerged_with_ce(
             model_config=model_config, prompt_inputs=prompt_inputs, label_mask=label_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, m_first_tok_id=m_first_tok_id,m_first_tok_logp=m_first_tok_logp, 
-            m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=self.pad_token_id, eos_id=self.eos_token_id, detach_prompt_cache=detach_prompt_cache, tau_retrieval=tau_retrieval, top_k=top_k, chunk_size=20, mode=mode, add_kl=add_kl
+            m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=self.pad_token_id, eos_id=self.eos_token_id, detach_prompt_cache=detach_prompt_cache, tau_retrieval=tau_retrieval, top_k=top_k, chunk_size=10, mode=mode, add_kl=add_kl,train_base=train_base
         )
         
         return out
@@ -888,7 +906,7 @@ def listwise_kl_loss(seq_scores, teacher_target_q, tau_s=1.0):
     seq_scores: [m]
     teacher_target_q: [m], sums to 1
     """
-    teacher_target_q = teacher_target_q.softmax(-1)
-    student_log_probs = F.log_softmax(seq_scores / tau_s, dim=0)
-    loss = F.kl_div(student_log_probs, teacher_target_q, reduction="sum")
+    #teacher_target_q = teacher_target_q.softmax(-1)
+    student_log_probs = F.log_softmax(seq_scores, dim=0)
+    loss = F.kl_div(student_log_probs, teacher_target_q, reduction="sum", log_target=True)
     return loss
