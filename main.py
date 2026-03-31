@@ -7,6 +7,7 @@ p.add_argument("--ce_weight", type=float, default=1.)
 p.add_argument("--kd_weight", type=float, default=0.5)
 p.add_argument("--lr", type=float, default=1e-5)
 p.add_argument("--device", type=str, default="0,1")
+p.add_argument("--no_tea", action="store_true")
 args = p.parse_args()
 
 import os
@@ -730,7 +731,7 @@ def main():
     
     no_tea = "notea" if args.no_tea else ""
     if accel.is_main_process:
-       wandb_run = wandb.init(project="MMMem", name=f"CEKD_t{args.ret_tau}_k{args.top_k}_listkl_last_layer_wide_stmean_lr{args.lr}")
+       wandb_run = wandb.init(project="MMMem", name=f"CEKD_t{args.ret_tau}_k{args.top_k}_shrink_ce_lr{args.lr}")
 
     # accel.wait_for_everyone()
     # model.eval()
@@ -850,7 +851,7 @@ def main():
             #inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores = batch
             inputs, input_lengths, answer_ids, answer_mask, answer_lengths, answer_eval, data_id, cand_tokens, ret_scores, sum_cand_logps, candidate_mask, m_first_tok_id, m_first_tok_logp, m_first_tok_tail = batch
             #stats = train_step(model,unw_model.config, accel, processor, optimizer,scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  teacher_ids, teacher_logps, teacher_tails, ret_scores)
-            stats = train_step_temperature(model,unw_model.config, accel, processor, optimizer, scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  cand_tokens, ret_scores, sum_cand_logps,m_first_tok_id, m_first_tok_logp, m_first_tok_tail, candidate_mask, mode="listkl")
+            stats = train_step_temperature(model,unw_model.config, accel, processor, optimizer, scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  cand_tokens, ret_scores, sum_cand_logps,m_first_tok_id, m_first_tok_logp, m_first_tok_tail, candidate_mask, mode="seqkd")
             
             acc_loss.append(stats['loss'])
             cur_loss = np.mean(acc_loss)
@@ -877,7 +878,7 @@ def main():
                 accel.wait_for_everyone()
                 state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
                 if accel.is_main_process:
-                    torch.save(state, f"/data_external/video/code/MPM/checkpoints/ep{ep}step{step}_ce_kd.pt")
+                    torch.save(state, f"/data_external/video/code/MPM/checkpoints/ep{ep}step{step}_ce_kd_{args.device}.pt")
 
                 accel.wait_for_everyone()
                 model.eval()
@@ -909,7 +910,7 @@ def main():
         accel.wait_for_everyone()
         state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
         if accel.is_main_process:
-            torch.save(state, f"/data_external/video/code/MPM/checkpoints/{ep}_ce_kd.pt")
+            torch.save(state, f"/data_external/video/code/MPM/checkpoints/{ep}_ce_kd_{args.device}.pt")
         accel.wait_for_everyone()
 
         # saved_dict = torch.load('/data_external/MMPMem/checkpoints/0_ce_only.pt')
