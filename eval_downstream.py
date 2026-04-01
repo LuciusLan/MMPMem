@@ -1,8 +1,10 @@
 import os, json, math, argparse
-
-
+p = argparse.ArgumentParser()
+p.add_argument("--lam", type=float, default=0.6)
+p.add_argument("--device", type=str, default="0")
+args = p.parse_args()
 #os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ['CUDA_VISIBLE_DEVICES']="1"
+os.environ['CUDA_VISIBLE_DEVICES']=args.device
 #os.environ["HF_HOME"]='/data_external/hf_cache'
 #os.environ['VLLM_FLASH_ATTN_VERSION']="2"
 os.environ['PYTORCH_CUDA_ALLOC_CONF']='expandable_segments:True'
@@ -50,12 +52,12 @@ test_ds = datasets.load_from_disk('/data_external/video/datasets/MPM/evqa_test')
 #test_ds:HFDataset = datasets.concatenate_datasets([test_ds['train'], test_ds['test']])
 #test_ds = test_ds.cast_column('image', HFImage(decode=True))
 
-processor= Qwen3VLProcessor.from_pretrained('/data_external/video/models/Qwen3-VL-8B-Instruct')
-base_model = Qwen3VLForConditionalGeneration.from_pretrained("/data_external/video/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
+processor= Qwen3VLProcessor.from_pretrained('/data_external/video/models/Qwen3-VL-8B-Instruct', min_pixels=256 * 28 * 28, max_pixels=3000 * 28 * 28)
+base_model = Qwen3VLForConditionalGeneration.from_pretrained("/data_external/video/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16, device_map='cuda')
 
 memory = MemoryMLP()
 memory = memory.to('cuda')
-saved_dict = torch.load('/data_external/video/codes/MPM/checkpoints/kd_eq_weight_k30_t07.pt')
+saved_dict = torch.load('/data_external/video/code/MPM/checkpoints/kd_eq_weight_k30_t07.pt')
 memory.load_state_dict(saved_dict, strict=True)
 
 model = WrappedLM(base_model, memory, config=base_model.config, processor=processor, layer_idx_for_mem=-1)
@@ -65,9 +67,9 @@ model = WrappedLM(base_model, memory, config=base_model.config, processor=proces
 
 def process_prompt(inputs):
     question = inputs['question']
-    for key in mcq_keys:
-        question+= f' {key}: {inputs[key]} |'
-    question=question[:-2]+'\n'
+    #for key in mcq_keys:
+    #    question+= f' {key}: {inputs[key]} |'
+    #question=question[:-2]+'\n'
 
     messages = [
             {
@@ -148,17 +150,18 @@ cb=0
 
 pbar = tqdm(total=len(test_ds))
 pm_wrong= []
-pred_file = open('/data_external/video/codes/MPM/evqa_pred.txt', 'w')
+lam = args.lam
+pred_file = open(f'/data_external/video/code/MPM/evqa_pred_l0.0.txt', 'w')
 for step,row in enumerate(test_ds):
     inputs = process_prompt(row)
     inputs = inputs.to('cuda')
     with torch.inference_mode():
-        output_ids = model.generate(**inputs, mix_mode='mix', mix_lambda=0.8, branch="generation")
+        output_ids = model.generate(**inputs, mix_mode='base', mix_lambda=lam, branch="generation")
         input_len = inputs.input_ids.size(1)
         generated_ids = output_ids[:, input_len:]
         text = processor.decode(generated_ids, skip_special_tokens=True)[0]
         #gid, _, text_base = generate_with_memory(model, memory, processor.tokenizer, inputs, eos_token_id=processor.tokenizer.eos_token_id, max_new_tokens=40, eta_or_lambda=1.)
-        pred_file.write(f"{text}<s>{row['answer']}")
+        pred_file.write(f"{text}<s>{row['answer']}<s>{row['question']}")
     
 
     # try:
