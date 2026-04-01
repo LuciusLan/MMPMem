@@ -594,7 +594,7 @@ def main():
     #train_ds = train_ds.select(range(100000))
     #test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_combined').with_format('torch')
     test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_full').with_format('torch')
-    test_ds = test_ds.filter(lambda x: x['utype'] == 'val_unseen_question') #val_unseen_entity
+    test_ds = test_ds.filter(lambda x: x['utype'] == 'val_unseen_entity') # val_unseen_question
     # UE 54964 , UQ 18656, total 73620
     #test_ds = test_ds.select(range(5000))
 
@@ -603,7 +603,7 @@ def main():
        p.requires_grad_(False)
 
     lora_rank = 540
-    from peft import LoraConfig, get_peft_model, TaskType
+    from peft import LoraConfig, get_peft_model, TaskType, PeftModel
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
@@ -621,8 +621,9 @@ def main():
         ],
     )
 
-    base_model = get_peft_model(base_model, peft_config)
-    base_model.print_trainable_parameters()
+    #base_model = get_peft_model(base_model, peft_config)
+    #base_model.print_trainable_parameters()
+    base_model = PeftModel.from_pretrained(base_model, "/data_external/MMPMem/checkpoints/lora_step4000.pt/")
     # #base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="eager", dtype=torch.float16, device_map='cpu')
 
     processor = AutoProcessor.from_pretrained('/wyy/models/Qwen3-VL-8B-Instruct')
@@ -721,7 +722,7 @@ def main():
     #     stats.append([has_correct, rank])
     #     pass
     #train_dl.__iter__().__next__()
-    test_dl = DataLoader(test_ds, batch_size=4, collate_fn=collate_eval,) #num_workers=5, prefetch_factor=2,)
+    test_dl = DataLoader(test_ds, batch_size=10, collate_fn=collate_eval,) #num_workers=5, prefetch_factor=2,)
 
     
     num_warmup_steps = 200
@@ -751,9 +752,9 @@ def main():
     unw_model = accel.unwrap_model(model)
     _memory = unw_model.memory
     
-    if accel.is_main_process:
-        #wandb_run = wandb.init(project="MMMem", name=f"CEKD_t{args.ret_tau}_k{args.top_k}_listkl_standard_ce_lr{args.lr}")
-        wandb_run = wandb.init(project="MMMem", name=f"train_lora_only")
+    # if accel.is_main_process:
+    #     #wandb_run = wandb.init(project="MMMem", name=f"CEKD_t{args.ret_tau}_k{args.top_k}_listkl_standard_ce_lr{args.lr}")
+    #     wandb_run = wandb.init(project="MMMem", name=f"train_lora_only")
 
     # accel.wait_for_everyone()
     # model.eval()
@@ -800,50 +801,50 @@ def main():
     #     wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
     accel.wait_for_everyone()
 
-    # correct = torch.tensor(0., device=model.device)
-    # gathered_results_mix = []
-    # print('UE')
-    # with torch.inference_mode():
-    #     for lam in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
-    #         correct = torch.tensor(0., device=model.device)
-    #         for row in tqdm(test_dl):
-    #             inputs, gts, data_ids = row
-    #             output_ids = unw_model.generate(**inputs, mix_mode='mix', mix_lambda=lam, branch="generation")
-    #             input_len = inputs.input_ids.size(1)
-    #             generated_ids = output_ids[:, input_len:]
-    #             text = processor.batch_decode(generated_ids, skip_special_tokens=True)
+    correct = torch.tensor(0., device=model.device)
+    gathered_results_mix = []
+    print('UE')
+    with torch.inference_mode():
+        #for lam in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+            correct = torch.tensor(0., device=model.device)
+            for row in tqdm(test_dl):
+                inputs, gts, data_ids = row
+                output_ids = unw_model.generate(**inputs, mix_mode='base', mix_lambda=0.6, branch="generation")
+                input_len = inputs.input_ids.size(1)
+                generated_ids = output_ids[:, input_len:]
+                text = processor.batch_decode(generated_ids, skip_special_tokens=True)
 
-    #             local_results = []
-    #             for gt, pred, did in zip(gts, text, data_ids):
-    #                 if '{' in gt[0] and '}' in gt[0]:
-    #                     gt = ast.literal_eval(gt[0])
-    #                 score_m = score_infoseek(pred, gt)
-    #                 correct += score_m['acc']
-    #                 local_results.append({"score": 1 if score_m['acc']>0 else 0, "data_id": did, 'gt': gt, 'pred': pred})
+                local_results = []
+                for gt, pred, did in zip(gts, text, data_ids):
+                    if '{' in gt[0] and '}' in gt[0]:
+                        gt = ast.literal_eval(gt[0])
+                    score_m = score_infoseek(pred, gt)
+                    correct += score_m['acc']
+                    local_results.append({"score": 1 if score_m['acc']>0 else 0, "data_id": did, 'gt': gt, 'pred': pred})
 
-    #             # gathered = accel.gather_for_metrics(
-    #             #     local_results,
-    #             #     use_gather_object=True,
-    #             # )
-    #             # if accel.is_main_process:
-    #             #     # Normalize in case the gathered structure is nested by rank
-    #             #     if len(gathered) > 0 and isinstance(gathered[0], list):
-    #             #         gathered = [x for chunk in gathered for x in chunk]
-    #             #     gathered_results_mix.extend(gathered)
+                # gathered = accel.gather_for_metrics(
+                #     local_results,
+                #     use_gather_object=True,
+                # )
+                # if accel.is_main_process:
+                #     # Normalize in case the gathered structure is nested by rank
+                #     if len(gathered) > 0 and isinstance(gathered[0], list):
+                #         gathered = [x for chunk in gathered for x in chunk]
+                #     gathered_results_mix.extend(gathered)
 
-    #         accel.wait_for_everyone()
-    #         correct = accel.reduce(correct, reduction="sum")
-    #         if accel.is_main_process:
-    #             correct = correct.item()
-    #             gathered_results_mix.sort(key=lambda x: x["data_id"])
-    #             print(f'Lambda: {lam}')
-    #             print(correct)
-    #             print(correct / len(test_ds))
-    #             print()
-    #             #wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
-    #         accel.wait_for_everyone()
+            accel.wait_for_everyone()
+            correct = accel.reduce(correct, reduction="sum")
+            if accel.is_main_process:
+                correct = correct.item()
+                #gathered_results_mix.sort(key=lambda x: x["data_id"])
+                #print(f'Lambda: {lam}')
+                print(correct)
+                print(correct / len(test_ds))
+                print()
+                #wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
+            accel.wait_for_everyone()
     #torch.save(gathered_results_mix, "/latent_aug/MMPMem/best_result_base_ue.pt")
-    #return
+    return
     # torch.save([gathered_results_base, gathered_results_mix], "/latent_aug/MMPMem/result_analy_ue.pt")
 
     # unseen question 
