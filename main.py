@@ -62,7 +62,7 @@ KL_WEIGHT = 0.3
 USE_RESIDUAL = False       # if True: memory learns residual logits; else memory outputs a dist directly
 HID_LAYER_ID = -1
 EPS = 1e-12
-MACRO_BATCH_SIZE = 8
+MACRO_BATCH_SIZE = 16
 LR = args.lr
 
 # =========================
@@ -592,17 +592,39 @@ def main():
 
     #train_ds = train_ds.cast_column("image", HFImage(decode=True))
     #train_ds = train_ds.select(range(100000))
-    test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_combined').with_format('torch')
-    #test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_full').with_format('torch')
-    #test_ds = test_ds.filter(lambda x: x['utype'] == 'val_unseen_entity') #val_unseen_question
+    #test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_combined').with_format('torch')
+    test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_full').with_format('torch')
+    test_ds = test_ds.filter(lambda x: x['utype'] == 'val_unseen_question') #val_unseen_entity
+    # UE 54964 , UQ 18656, total 73620
     #test_ds = test_ds.select(range(5000))
 
     base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
+    for p in base_model.parameters():
+       p.requires_grad_(False)
 
+    lora_rank = 540
+    from peft import LoraConfig, get_peft_model, TaskType
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=lora_rank,
+        lora_alpha=lora_rank,   # reasonable default when not specified
+        lora_dropout=0.0,       # set >0 only if you want regularization
+        bias="none",
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+    )
+
+    base_model = get_peft_model(base_model, peft_config)
+    base_model.print_trainable_parameters()
     # #base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="eager", dtype=torch.float16, device_map='cpu')
 
-    for p in base_model.parameters():
-       p.requires_grad_(True)
     processor = AutoProcessor.from_pretrained('/wyy/models/Qwen3-VL-8B-Instruct')
 
     memory = MemoryMLP()
@@ -723,7 +745,7 @@ def main():
         find_unused_parameters=True,
         static_graph=False,
     )
-    accel = Accelerator(kwargs_handlers=[ddp], gradient_accumulation_steps=2)
+    accel = Accelerator(kwargs_handlers=[ddp], gradient_accumulation_steps=1)
     model, optimizer,scheduler, train_dl, test_dl = accel.prepare(model, optimizer, scheduler, train_dl, test_dl)
 
     unw_model = accel.unwrap_model(model)
@@ -731,7 +753,7 @@ def main():
     
     if accel.is_main_process:
         #wandb_run = wandb.init(project="MMMem", name=f"CEKD_t{args.ret_tau}_k{args.top_k}_listkl_standard_ce_lr{args.lr}")
-        wandb_run = wandb.init(project="MMMem", name=f"train_base_only")
+        wandb_run = wandb.init(project="MMMem", name=f"train_lora_only")
 
     # accel.wait_for_everyone()
     # model.eval()
@@ -879,12 +901,13 @@ def main():
             if step%10 == 0:
                 torch.cuda.empty_cache()
 
-            if step%3000 == 0 and step != 0:
-                #accel.wait_for_everyone()
+            if step%2000 == 0: #and step != 0:
+                accel.wait_for_everyone()
                 #state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
                 if accel.is_main_process:
                     #torch.save(state, f"/data_external/MMPMem/checkpoints/ep{ep}step{step}_ce_kd.pt")
-                    unw_model.base_lm.save_pretrained(f"/data_external/MMPMem/checkpoints/tb_step{step}.pt")
+                    #unw_model.base_lm.save_pretrained(f"/data_external/MMPMem/checkpoints/lora_step{step}.pt")
+                    unw_model.base_model.save_pretrained(f"/data_external/MMPMem/checkpoints/lora_step{step}.pt")
 
                 accel.wait_for_everyone()
                 model.eval()
@@ -921,7 +944,8 @@ def main():
         #state = accel.get_state_dict(_memory)         # gathered on rank 0, offloaded to CPU
         if accel.is_main_process:
             #torch.save(state, f"/data_external/MMPMem/checkpoints/{ep}_ce_kd.pt")
-            unw_model.base_lm.save_pretrained(f"/data_external/MMPMem/checkpoints/tb_ep0fin.pt")
+            #unw_model.base_lm.save_pretrained(f"/data_external/MMPMem/checkpoints/lora_ep0fin.pt")
+            unw_model.base_model.save_pretrained(f"/data_external/MMPMem/checkpoints/lora_ep0fin.pt")
         accel.wait_for_everyone()
 
         # saved_dict = torch.load('/data_external/MMPMem/checkpoints/0_ce_only.pt')
