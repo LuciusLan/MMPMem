@@ -100,8 +100,9 @@ class WrappedLM(nn.Module, GenerationMixin):
     def __init__(self, base_model: Qwen3VLForConditionalGeneration, memory: MemoryMLP, config, processor, layer_idx_for_mem=32):
         super().__init__()
         self.base_model = base_model
-        self.base_lm = base_model.base_model
-        self.base_lm_model: Qwen3VLModel = base_model.base_model.model.model
+        self.base_lm = base_model
+        self.base_lm_model=base_model.model
+        #self.base_lm_model: Qwen3VLModel = base_model.base_model.model.model
         self.lm_head = base_model.lm_head
         self.memory = memory
         self.layer_idx_for_mem = layer_idx_for_mem

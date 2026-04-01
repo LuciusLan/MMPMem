@@ -594,36 +594,38 @@ def main():
     #train_ds = train_ds.select(range(100000))
     #test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_combined').with_format('torch')
     test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_full').with_format('torch')
-    test_ds = test_ds.filter(lambda x: x['utype'] == 'val_unseen_entity') # val_unseen_question
+    test_ds = test_ds.filter(lambda x: x['utype'] == 'val_unseen_question') # val_unseen_entity
     # UE 54964 , UQ 18656, total 73620
     #test_ds = test_ds.select(range(5000))
 
-    base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
+    #base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
+    base_model = Qwen3VLForConditionalGeneration.from_pretrained("/data_external/MMPMem/checkpoints/tb_step2000.pt", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
+
     for p in base_model.parameters():
        p.requires_grad_(False)
 
-    lora_rank = 540
-    from peft import LoraConfig, get_peft_model, TaskType, PeftModel
-    peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=lora_rank,
-        lora_alpha=lora_rank,   # reasonable default when not specified
-        lora_dropout=0.0,       # set >0 only if you want regularization
-        bias="none",
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
-    )
+    # lora_rank = 540
+    # from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+    # peft_config = LoraConfig(
+    #     task_type=TaskType.CAUSAL_LM,
+    #     inference_mode=False,
+    #     r=lora_rank,
+    #     lora_alpha=lora_rank,   # reasonable default when not specified
+    #     lora_dropout=0.0,       # set >0 only if you want regularization
+    #     bias="none",
+    #     target_modules=[
+    #         "q_proj",
+    #         "k_proj",
+    #         "v_proj",
+    #         "gate_proj",
+    #         "up_proj",
+    #         "down_proj",
+    #     ],
+    # )
 
     #base_model = get_peft_model(base_model, peft_config)
     #base_model.print_trainable_parameters()
-    base_model = PeftModel.from_pretrained(base_model, "/data_external/MMPMem/checkpoints/lora_step4000.pt/")
+    #base_model = PeftModel.from_pretrained(base_model, "/data_external/MMPMem/checkpoints/lora_step4000.pt/")
     # #base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="eager", dtype=torch.float16, device_map='cpu')
 
     processor = AutoProcessor.from_pretrained('/wyy/models/Qwen3-VL-8B-Instruct')
