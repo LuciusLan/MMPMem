@@ -634,8 +634,8 @@ def main():
     # for p in memory.parameters():
     #     p.requires_grad_(True)
 
-    # print(next(memory.parameters()).device)
-    # print(sum(p.numel() for p in memory.parameters()) / 1e9, "B params")
+    #print(next(memory.parameters()).device)
+    print(sum(p.numel() for p in memory.parameters()) / 1e9, "B params")
 
     # saved_dict = torch.load('/data_external/MMPMem/checkpoints/kd_eq_weight_k30_t07.pt')
     # memory.load_state_dict(saved_dict, strict=True)

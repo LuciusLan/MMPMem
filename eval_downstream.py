@@ -52,7 +52,7 @@ test_ds = test_ds.cast_column('image', HFImage(decode=True))
 
 processor= Qwen3VLProcessor.from_pretrained('/wyy/models/Qwen3-VL-8B-Instruct')
 base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
-
+#base_model = Qwen3VLForConditionalGeneration.from_pretrained("/data_external/MMPMem/checkpoints/tb_step2000.pt", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
 memory = MemoryMLP()
 memory = memory.to('cuda')
 saved_dict = torch.load('/data_external/MMPMem/checkpoints/kd_eq_weight_k30_t07.pt')
@@ -151,7 +151,7 @@ for step,row in enumerate(test_ds):
     inputs = process_prompt(row)
     inputs = inputs.to('cuda')
     with torch.inference_mode():
-        output_ids = model.generate(**inputs, mix_mode='mix', mix_lambda=0.8, branch="generation")
+        output_ids = model.generate(**inputs, mix_mode='base', mix_lambda=0.8, branch="generation")
         input_len = inputs.input_ids.size(1)
         generated_ids = output_ids[:, input_len:]
         text = processor.decode(generated_ids, skip_special_tokens=True)[0]
