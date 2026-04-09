@@ -26,6 +26,7 @@ import json
 import math
 import random
 from dataclasses import dataclass
+from collections import Counter, defaultdict
 import time
 
 import numpy as np
@@ -515,10 +516,103 @@ def gen(input_ds, processor, device):
         sample = {'data_id':data_id[0], 'cand_tokens': cand_tokens, 'ret_scores': retrieval_sims_raw, "sum_cand_logps": teacher_conf_raw.squeeze(0), "candidate_mask":candidate_mask.squeeze(0), 'm_first_tok_id': first_ids_list, 'm_first_tok_logp':first_logp_list, 'm_first_tok_tail': first_tail_list, "keep": gt_is_ranked_top, "candidate_gt_rank": gt_rank, "candidate_mass":top_weight, "gt": str(gt)}
         yield sample
 
+def tokenize_with_none(tokenizer, texts, **tok_kwargs):
+    # texts: list[str | None]
+
+    if tokenizer.pad_token_id is None:
+        # common fallback for decoder-only tokenizers
+        tokenizer.pad_token = tokenizer.eos_token
+
+    valid_idx = [i for i, t in enumerate(texts) if t is not None]
+    valid_texts = [texts[i] for i in valid_idx]
+
+    if len(valid_texts) == 0:
+        # choose a width explicitly if you need nonzero sequence length
+        max_len = tok_kwargs.get("max_length", 0)
+        return {
+            "input_ids": torch.full((len(texts), max_len), tokenizer.pad_token_id, dtype=torch.long),
+            "attention_mask": torch.zeros((len(texts), max_len), dtype=torch.long),
+        }
+
+    enc = tokenizer(
+        valid_texts,
+        return_tensors="pt",
+        **tok_kwargs,   # e.g. padding=True, truncation=True
+    )
+
+    B = len(texts)
+    L = enc["input_ids"].shape[1]
+
+    out = {
+        "input_ids": torch.full((B, L), tokenizer.pad_token_id, dtype=enc["input_ids"].dtype),
+        "attention_mask": torch.zeros((B, L), dtype=enc["attention_mask"].dtype),
+    }
+
+    if "token_type_ids" in enc:
+        pad_ttype = getattr(tokenizer, "pad_token_type_id", 0)
+        if pad_ttype is None:
+            pad_ttype = 0
+        out["token_type_ids"] = torch.full((B, L), pad_ttype, dtype=enc["token_type_ids"].dtype)
+
+    j = 0
+    for i, t in enumerate(texts):
+        if t is not None:
+            out["input_ids"][i] = enc["input_ids"][j]
+            out["attention_mask"][i] = enc["attention_mask"][j]
+            if "token_type_ids" in enc:
+                out["token_type_ids"][i] = enc["token_type_ids"][j]
+            j += 1
+
+    return out
+
 def process_ds():
     train_ds = datasets.load_from_disk('/data_external/InfoSeek/train_gen_combined').with_format('torch')
+    train_id_map = {tid: i for i, tid in enumerate(train_ds['data_id'])}
     #train_ds = train_ds.remove_columns(["per_ev_top_ids", "per_ev_top_logps", "per_ev_tail"])
-    processor = AutoProcessor.from_pretrained('/wyy/models/Qwen3-VL-8B-Instruct')
+    processor = AutoProcessor.from_pretrained('/data_external/Qwen3-VL-4B-Instruct')
+
+    distill_ds = datasets.load_from_disk('/data_external/InfoSeek/distill_train').with_format('torch')
+    distill_ids = distill_ds['data_id']
+    #distill_id_map = {did: i for i, did in enumerate(distill_ids)}
+
+    with open('/data_external/InfoSeek/infoseek_train.jsonl') as f:
+        train = [json.loads(e) for e in f.readlines()]
+
+    train_questions = [e['question'] for e in train]
+    train_oven_ids = [e['image_id'] for e in train]
+    count_tq = Counter(train_questions)
+    #coun_tq = {k: v for k,v in count_tq.items()}
+
+    with open('/data_external/InfoSeek/query_ret_imgs_qwen.jsonl') as f:
+        ret_images = [json.loads(e) for e in f.readlines()]
+
+    with open("/data_external/InfoSeek/oven_entity_train.jsonl") as f:
+        oven = f.readlines()
+        oven = [json.loads(e) for e in tqdm(oven)]
+    with open("/data_external/InfoSeek/oven_entity_val.jsonl") as f:
+        temp = f.readlines()
+        temp = [json.loads(e) for e in temp]
+    oven.extend(temp)
+    oven_image_id_entity_map = {e['image_id']:e['entity_text'] for e in tqdm(oven)}
+
+
+    train_entities = [oven_image_id_entity_map[id] for id in train_oven_ids]
+    train_entities_unique = set(train_entities)
+    train_query_entity_map = defaultdict(set)
+    train_entity_query_map = defaultdict(set)
+    train_qe_combination_to_answer = defaultdict(str)
+
+    train_ent_query_combinations = []
+    for row in tqdm(train):
+        ent = oven_image_id_entity_map[row['image_id']]
+        train_query_entity_map[ent].add(row['question'])
+        train_entity_query_map[row['question']].add(ent)
+        train_ent_query_combinations.append(f'{ent}|{row["question"]}')
+        if len(train_qe_combination_to_answer[f'{ent}|{row["question"]}']) == 0:
+            train_qe_combination_to_answer[f'{ent}|{row["question"]}'] = row['answer']
+
+    #count_ent_qs = Counter(train_ent_query_combinations)
+
     def collate_train_raw(batch):
         row = {k: [e[k] for e in batch] for k in batch[0].keys()}
         question = row['question']
@@ -537,6 +631,85 @@ def process_ds():
         ret_scores = row['scores']
         return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores, row['answer_eval'], row['data_id']
 
+    def collate_new_distill(batch):
+        assert len(batch) == 1
+        dis_row = batch[0]
+        data_id = dis_row['data_id']
+        data_id_int = int(data_id.split('_')[-1])
+        train_idx = train_id_map[data_id]
+        row_train = train_ds[train_idx]
+        row_ret = ret_images[data_id_int]
+        assert dis_row['data_id'] == row_train['data_id'] and dis_row['data_id'] == row_ret['question_id']
+        top = row_ret['ret_images']
+        top = [e.split('/')[-1].split('.')[0] for e in top]
+
+        question = row_train['question']
+        qimg = row_train['image']
+        answer = row_train['answer']
+        gt_ent = oven_image_id_entity_map[row_train['image_id']]
+        gt_answer = random.choice(answer)+processor.tokenizer.eos_token+'\n'
+        #qid = row['data_id']
+
+        inputs, input_lengths, answer_ids, answer_mask, answer_lengths = process_input(processor, [question], [qimg], [gt_answer])
+        teacher_ids = row_train['per_ev_top_ids']
+        teacher_logps = row_train['per_ev_top_logps']
+        for i in range(len(teacher_ids)):
+            pad_pos = teacher_ids[i] == -1
+            teacher_ids[i][pad_pos] = processor.tokenizer.pad_token_id
+        teacher_tails = row_train['per_ev_tail']
+        ret_scores = row_train['scores']
+        ##########
+        top_entity = []
+        identical_gt = []
+        merged_scores = []
+        merged_answers = []
+        for j, id in enumerate(top):
+            try:
+                ret_ent = oven_image_id_entity_map[id]
+            except KeyError:
+                #notfound += 1
+                ret_ent = f'unknown{j}'
+
+            top_entity.append(ret_ent)
+            if ret_ent in train_entities_unique:
+                train_q = row_train['question']
+                train_q_ents = train_entity_query_map[train_q]
+                if ret_ent in train_q_ents:
+                    if ret_ent == gt_ent:
+                        igt = gt_answer
+                    else:
+                        igt = train_qe_combination_to_answer[f'{ret_ent}|{train_q}']
+                        igt = random.choice(igt)
+                    identical_gt.append(igt)
+                else:
+                    identical_gt.append(None)
+            else:
+                identical_gt.append(None)
+
+        identical_gt_ids = tokenize_with_none(processor.tokenizer, identical_gt)
+        # TODO: Replace teacher id to true GT here, then merge
+        return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores, row['answer_eval'], row['data_id']
+
+    train_dl = DataLoader(distill_ds, batch_size=1, shuffle=False, collate_fn=collate_new_distill)
+    for step, batch in enumerate(train_dl):
+        inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores, eval_answer, data_id = batch
+
+        gt = eval_answer[0]
+        if '{' in gt[0] and '}' in gt[0]:
+            gt = ast.literal_eval(gt[0])
+        #score = score_infoseek(cand_answer, gt)
+        pbar.update()
+        stats_out = get_stats_step(model=None, processor=processor, device='cpu', base_inputs=inputs, input_lengths=input_lengths, answer_ids=answer_ids, answer_mask=answer_mask, teacher_ids=teacher_ids, teacher_logprob=teacher_logps, tail_logprob=teacher_tails, ret_scores=ret_scores, gt=gt, score_func=score_infoseek, tokenizer=processor.tokenizer, tau=1.)
+        if stats_out is not None:
+            cand_tokens,retrieval_sims_raw, teacher_conf_raw,candidate_mask, first_ids_list, first_logp_list, first_tail_list, gt_is_ranked_top, gt_rank, top_weight, merged_score = stats_out
+        else:
+            continue
+        
+        if retrieval_sims_raw.size(0) == 1:
+            continue
+        elif retrieval_sims_raw.std().isnan():
+            continue
+
     from datasets import Features, Sequence, Value 
     features = Features({
         "data_id": Value("string"),
@@ -552,8 +725,8 @@ def process_ds():
         "candidate_mass": Value("float32"),
         "gt": Value("string"),
     })
-
-    train_dl = DataLoader(train_ds, batch_size=1, shuffle=False, collate_fn=collate_train_raw, prefetch_factor=2, num_workers=6)
+    
+    train_dl = DataLoader(train_ds, batch_size=1, shuffle=False, collate_fn=collate_train_raw) #, prefetch_factor=2, num_workers=6)
 
     distil_dataset = HFDataset.from_generator(gen, features=features, gen_kwargs={'input_ds': train_dl, 'processor':processor, 'device': "cpu"})
     distil_dataset.save_to_disk('/data_external/InfoSeek/distill_train')
@@ -997,5 +1170,5 @@ def set_determinism(seed):
 
 if __name__ == "__main__":
     set_determinism(2026)
-    main()
-    #process_ds()
+    #main()
+    process_ds()
