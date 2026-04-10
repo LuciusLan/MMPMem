@@ -26,7 +26,7 @@ import json
 import math
 import random
 from dataclasses import dataclass
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, OrderedDict
 import time
 
 import numpy as np
@@ -51,7 +51,7 @@ from accelerate.utils import tqdm
 from modelling_memory import MemoryMLP, WrappedLM
 from inference import generate_with_memory
 from eval_util import score_infoseek
-from seq_kd_utils import compute_seqkd_or_mml_loss, extract_top1_sequences_and_logp, compute_candidate_log_weights_for_cache, label_candidate
+from seq_kd_utils import compute_seqkd_or_mml_loss, extract_top1_sequences_and_logp, compute_candidate_log_weights_for_cache, label_candidate, trim_excess_right_padding
 
 # ---------------------------
 # Hyperparameters & utilities
@@ -245,7 +245,6 @@ def get_stats_step(model:WrappedLM, processor, device, base_inputs: BatchFeature
         candidate_mask = torch.isfinite(retrieval_sims)
 
         cand_texts = processor.batch_decode(cand_tokens, skip_special_tokens=True)
-
         counts_mask = (cand_tokens == 151643).sum(dim=1)
         cand_length = cand_tokens.size(1) - counts_mask
         has_abst = torch.tensor([_contains_abstention(e, _ABSTENTION_PATTERNS) for e in cand_texts], dtype=torch.bool)
@@ -492,30 +491,6 @@ def process_teacher_batch(mix_idx, mix_logp, tail_logp, answer_lengths:list[int]
         tail_logprob[i, :La] = taillogp
     return teacher_ids_with, teacher_logprob_with, tail_logprob
 
-
-def gen(input_ds, processor, device):
-    pbar = tqdm(total=len(input_ds))
-    for step, batch in enumerate(input_ds):
-        inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores, eval_answer, data_id = batch
-
-        gt = eval_answer[0]
-        if '{' in gt[0] and '}' in gt[0]:
-            gt = ast.literal_eval(gt[0])
-        #score = score_infoseek(cand_answer, gt)
-        pbar.update()
-        stats_out = get_stats_step(model=None, processor=processor, device='cpu', base_inputs=inputs, input_lengths=input_lengths, answer_ids=answer_ids, answer_mask=answer_mask, teacher_ids=teacher_ids, teacher_logprob=teacher_logps, tail_logprob=teacher_tails, ret_scores=ret_scores, gt=gt, score_func=score_infoseek, tokenizer=processor.tokenizer, tau=1.)
-        if stats_out is not None:
-            cand_tokens,retrieval_sims_raw, teacher_conf_raw,candidate_mask, first_ids_list, first_logp_list, first_tail_list, gt_is_ranked_top, gt_rank, top_weight, merged_score = stats_out
-        else:
-            continue
-        
-        if retrieval_sims_raw.size(0) == 1:
-            continue
-        elif retrieval_sims_raw.std().isnan():
-            continue
-        sample = {'data_id':data_id[0], 'cand_tokens': cand_tokens, 'ret_scores': retrieval_sims_raw, "sum_cand_logps": teacher_conf_raw.squeeze(0), "candidate_mask":candidate_mask.squeeze(0), 'm_first_tok_id': first_ids_list, 'm_first_tok_logp':first_logp_list, 'm_first_tok_tail': first_tail_list, "keep": gt_is_ranked_top, "candidate_gt_rank": gt_rank, "candidate_mass":top_weight, "gt": str(gt)}
-        yield sample
-
 def tokenize_with_none(tokenizer, texts, **tok_kwargs):
     # texts: list[str | None]
 
@@ -564,6 +539,255 @@ def tokenize_with_none(tokenizer, texts, **tok_kwargs):
             j += 1
 
     return out
+
+def merge_rows_from_tok_or_original(
+    original_tensor,          # [B, L_orig]
+    original_attention_mask,  # [B, L_orig]
+    tok_ids_with_none,        # [B, L_tok]
+    tok_attention_mask,       # [B, L_tok]
+    pad_id=0,
+):
+    B, L_orig = original_tensor.shape
+    B2, L_tok = tok_ids_with_none.shape
+    if B2 > B:
+        tok_ids_with_none = tok_ids_with_none[:B, :]
+        tok_attention_mask = tok_attention_mask[:B, :]
+
+    use_tok = tok_attention_mask.any(dim=1)   # [B]
+
+    L_out = max(L_orig, L_tok)
+
+    original_padded = F.pad(original_tensor, (0, L_out - L_orig), value=pad_id)
+    original_mask_padded = F.pad(original_attention_mask, (0, L_out - L_orig), value=0)
+
+    tok_padded = F.pad(tok_ids_with_none, (0, L_out - L_tok), value=pad_id)
+    tok_mask_padded = F.pad(tok_attention_mask, (0, L_out - L_tok), value=0)
+
+    merged = torch.where(use_tok[:, None], tok_padded, original_padded)
+    merged_attention_mask = torch.where(
+        use_tok[:, None],
+        tok_mask_padded,
+        original_mask_padded,
+    )
+
+    return merged, merged_attention_mask
+
+def append_eos_to_padded(
+    original_tensor,          # [B, L]
+    original_attention_mask,  # [B, L], 1 for real tokens, 0 for pad
+    eos_id,
+    pad_id,
+):
+    B, L = original_tensor.shape
+
+    lengths = original_attention_mask.sum(dim=1)   # [B]
+    need_extend = bool((lengths == L).any())
+    L_new = L + 1 if need_extend else L
+
+    out = torch.full(
+        (B, L_new),
+        pad_id,
+        dtype=original_tensor.dtype,
+        device=original_tensor.device,
+    )
+    out[:, :L] = original_tensor
+
+    out_mask = torch.zeros(
+        (B, L_new),
+        dtype=original_attention_mask.dtype,
+        device=original_attention_mask.device,
+    )
+    out_mask[:, :L] = original_attention_mask
+
+    row_idx = torch.arange(B, device=original_tensor.device)
+    out[row_idx, lengths] = eos_id
+    out_mask[row_idx, lengths] = 1
+
+    return out, out_mask
+
+def _answer_key_from_mask(answer_ids_row: torch.Tensor,
+                          answer_mask_row: torch.Tensor):
+    # exact token identity over the non-pad region only
+    return tuple(answer_ids_row[answer_mask_row.bool()].tolist())
+
+
+def _merge_ppl_score(ppl_values: torch.Tensor, mode: str = "sum") -> torch.Tensor:
+    """
+    Returns a scalar score where lower is better.
+
+    Supported modes:
+      - "mean":
+            arithmetic mean of perplexities.
+      - "inv_logsumexp":
+            score = -log(sum_i 1 / ppl_i)
+            This is not a true perplexity; it is a duplicate-favoring score.
+            Repeated identical answers reduce the score and thus help them win.
+      - "min":
+            minimum perplexity in the group.
+    """
+    v = ppl_values.float()
+    if (v <= 0).any():
+        raise ValueError("Perplexities must be strictly positive.")
+
+    if mode == "mean":
+        return v.mean()
+
+    elif mode == "sum":
+        # lower is better
+        # equivalent to aggregating pseudo-support proportional to 1/ppl
+        #return -torch.logsumexp(-torch.log(v), dim=0)
+        return v.sum()
+
+    elif mode == "min":
+        return v.min()
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+    
+def merge_identical_question_answers(
+    entity: List[str],               # length B
+    answer_ids: torch.Tensor,           # [B, L]
+    answer_mask: torch.Tensor,          # [B, L]
+    score: torch.Tensor,                  # [B]
+    invalid_mask: torch.Tensor,         # [B], True = valid, False = invalid
+    merge_mode: str = "sum",
+) -> Dict[str, Any]:
+    """
+    For each exact question string:
+      0) discard invalid rows using invalid_mask (True = valid),
+      1) group identical answers,
+      2) merge their perplexities,
+      3) keep the answer-group with the lowest merged score.
+
+    If a question has no valid answers after filtering, it is omitted from the output.
+    """
+
+    if not (
+        len(entity) == answer_ids.shape[0] == answer_mask.shape[0]
+        == score.shape[0] == invalid_mask.shape[0]
+    ):
+        raise ValueError(
+            "Batch dimension mismatch among entity / answer_ids / answer_mask / score / invalid_mask."
+        )
+
+    if invalid_mask.dtype != torch.bool:
+        invalid_mask = invalid_mask.bool()
+
+    B = len(entity)
+
+    # Keep only valid rows. Note: despite the name, True means valid.
+    valid_row_indices = [i for i in range(B) if not bool(invalid_mask[i].item())]
+
+    selected_entity = []
+    selected_rep_row_idx = []
+    selected_group_size = []
+    selected_member_indices = []
+    selected_score = []
+
+    per_entity_details = OrderedDict()
+
+    # Preserve first-seen order among valid rows only
+    entity_to_indices = OrderedDict()
+    for i in valid_row_indices:
+        q = entity[i]
+        entity_to_indices.setdefault(q, []).append(i)
+
+    for q, q_idxs in entity_to_indices.items():
+        # Group rows with the same exact answer tokens
+        answer_groups = OrderedDict()
+        for i in q_idxs:
+            ans_key = _answer_key_from_mask(answer_ids[i], answer_mask[i])
+            answer_groups.setdefault(ans_key, []).append(i)
+
+        candidates = []
+        for ans_key, member_idxs in answer_groups.items():
+            idx_tensor = torch.tensor(member_idxs, device=score.device, dtype=torch.long)
+            merged_score = _merge_ppl_score(score.index_select(0, idx_tensor), mode=merge_mode)
+
+            rep_idx = member_idxs[0]   # any member is fine; valid tokens are identical
+            candidates.append({
+                "answer_key": ans_key,
+                "member_indices": member_idxs,
+                "group_size": len(member_idxs),
+                "rep_idx": rep_idx,
+                "score": merged_score,
+            })
+
+        if len(candidates) == 0:
+            # all rows for this entity were invalid; skip
+            continue
+
+        best = min(candidates, key=lambda x: float(x["score"].detach().cpu()))
+
+        selected_entity.append(q)
+        selected_rep_row_idx.append(best["rep_idx"])
+        selected_group_size.append(best["group_size"])
+        selected_member_indices.append(best["member_indices"])
+        selected_score.append(best["score"])
+
+        per_entity_details[q] = [
+            {
+                "rep_idx": c["rep_idx"],
+                "member_indices": c["member_indices"],
+                "group_size": c["group_size"],
+                "score": float(c["score"].detach().cpu()),
+            }
+            for c in candidates
+        ]
+
+    if len(selected_rep_row_idx) == 0:
+        return {
+            "selected_entity": [],
+            "selected_answer_ids": answer_ids[:0],
+            "selected_answer_mask": answer_mask[:0],
+            "selected_score": score[:0].float(),
+            "selected_rep_row_idx": [],
+            "selected_group_size": [],
+            "selected_member_indices": [],
+            "per_entity_details": per_entity_details,
+        }
+
+    keep_idx = torch.tensor(selected_rep_row_idx, device=answer_ids.device, dtype=torch.long)
+
+    selected_answer_ids = answer_ids.index_select(0, keep_idx)
+    selected_answer_mask = answer_mask.index_select(0, keep_idx)
+    selected_score = torch.stack(selected_score)
+
+    return {
+        "selected_entity": selected_entity,
+        "selected_answer_ids": selected_answer_ids,
+        "selected_answer_mask": selected_answer_mask,
+        "selected_score": selected_score,                 # lower is better
+        "selected_rep_row_idx": selected_rep_row_idx,
+        "selected_group_size": selected_group_size,
+        "selected_member_indices": selected_member_indices,
+        "per_entity_details": per_entity_details,
+    }
+
+
+def gen(input_ds, processor, device):
+    pbar = tqdm(total=len(input_ds))
+    for step, batch in enumerate(input_ds):
+        inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores, eval_answer, data_id = batch
+
+        gt = eval_answer[0]
+        if '{' in gt[0] and '}' in gt[0]:
+            gt = ast.literal_eval(gt[0])
+        #score = score_infoseek(cand_answer, gt)
+        pbar.update()
+        stats_out = get_stats_step(model=None, processor=processor, device='cpu', base_inputs=inputs, input_lengths=input_lengths, answer_ids=answer_ids, answer_mask=answer_mask, teacher_ids=teacher_ids, teacher_logprob=teacher_logps, tail_logprob=teacher_tails, ret_scores=ret_scores, gt=gt, score_func=score_infoseek, tokenizer=processor.tokenizer, tau=1.)
+        if stats_out is not None:
+            cand_tokens,retrieval_sims_raw, teacher_conf_raw,candidate_mask, first_ids_list, first_logp_list, first_tail_list, gt_is_ranked_top, gt_rank, top_weight, merged_score = stats_out
+        else:
+            continue
+        
+        if retrieval_sims_raw.size(0) == 1:
+            continue
+        elif retrieval_sims_raw.std().isnan():
+            continue
+        sample = {'data_id':data_id[0], 'cand_tokens': cand_tokens, 'ret_scores': retrieval_sims_raw, "sum_cand_logps": teacher_conf_raw.squeeze(0), "candidate_mask":candidate_mask.squeeze(0), 'm_first_tok_id': first_ids_list, 'm_first_tok_logp':first_logp_list, 'm_first_tok_tail': first_tail_list, "keep": gt_is_ranked_top, "candidate_gt_rank": gt_rank, "candidate_mass":top_weight, "gt": str(gt)}
+        yield sample
+
 
 def process_ds():
     train_ds = datasets.load_from_disk('/data_external/InfoSeek/train_gen_combined').with_format('torch')
@@ -642,10 +866,12 @@ def process_ds():
         assert dis_row['data_id'] == row_train['data_id'] and dis_row['data_id'] == row_ret['question_id']
         top = row_ret['ret_images']
         top = [e.split('/')[-1].split('.')[0] for e in top]
+        top = top[:30]
 
         question = row_train['question']
         qimg = row_train['image']
         answer = row_train['answer']
+        eval_answer = row_train['answer_eval']
         gt_ent = oven_image_id_entity_map[row_train['image_id']]
         gt_answer = random.choice(answer)+processor.tokenizer.eos_token+'\n'
         #qid = row['data_id']
@@ -687,49 +913,81 @@ def process_ds():
                 identical_gt.append(None)
 
         identical_gt_ids = tokenize_with_none(processor.tokenizer, identical_gt)
+        extracted = extract_top1_sequences_and_logp(teacher_ids, teacher_logps)
+        teacher_ids = extracted[0]
+        teacher_id_mask = teacher_ids!=151643
+        teacher_ids, teacher_id_mask = append_eos_to_padded(teacher_ids, teacher_id_mask, 198,151643)
+        
         # TODO: Replace teacher id to true GT here, then merge
-        return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores, row['answer_eval'], row['data_id']
+        gt_and_teacher_ids, _ =  merge_rows_from_tok_or_original(teacher_ids, teacher_id_mask, identical_gt_ids['input_ids'], identical_gt_ids['input_ids']!=151643,pad_id=151643)
+        gt_and_teacher_ids = trim_excess_right_padding(gt_and_teacher_ids, 151643)
+
+
+        cand_texts = processor.batch_decode(gt_and_teacher_ids, skip_special_tokens=True)
+        counts_mask = (gt_and_teacher_ids == 151643).sum(dim=1)
+        cand_length = gt_and_teacher_ids.size(1) - counts_mask
+        has_abst = torch.tensor([_contains_abstention(e, _ABSTENTION_PATTERNS) for e in cand_texts], dtype=torch.bool)
+        too_long = cand_length > 30
+
+        invalid_cand = torch.logical_or(has_abst, too_long)
+        if invalid_cand.any():
+            ic = invalid_cand.sum()
+            if ic.item() > gt_and_teacher_ids.size(0)//2:
+                return None
+        
+        #merged_teacher_ids = 
+
+        merged = merge_identical_question_answers(top_entity, gt_and_teacher_ids, gt_and_teacher_ids!=151643, ret_scores, invalid_cand, "sum")
+        gt_is_ranked_top, gt_rank, top_weight, merged_scores = label_candidate(
+            cand_tokens=merged['selected_answer_ids'],
+            gt=eval_answer,
+            retrieval_sims_raw=merged['selected_score'],
+            teacher_conf_raw=None,
+            candidate_mask=torch.ones_like(merged['selected_score'],dtype=torch.bool),
+            pad_id=151643,
+            eos_id=151645,
+            score_func=score_infoseek,
+            tokenizer=processor.tokenizer,
+            tau_retrieval=args.ret_tau,
+        )
+        return {'data_id': data_id, 'cand_tokens': merged['selected_answer_ids'], 'ret_scores': merged['selected_score'], 'keep': gt_rank<2, 'candidate_gt_rank':gt_rank, 'candidate_mass': top_weight, 'gt': gt_answer, 'selected_entity': merged['selected_entity']}
+        #return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, gt_and_teacher_ids, teacher_logps, teacher_tails, ret_scores, row['answer_eval'], row['data_id']
 
     train_dl = DataLoader(distill_ds, batch_size=1, shuffle=False, collate_fn=collate_new_distill)
-    for step, batch in enumerate(train_dl):
-        inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores, eval_answer, data_id = batch
-
-        gt = eval_answer[0]
-        if '{' in gt[0] and '}' in gt[0]:
-            gt = ast.literal_eval(gt[0])
-        #score = score_infoseek(cand_answer, gt)
-        pbar.update()
-        stats_out = get_stats_step(model=None, processor=processor, device='cpu', base_inputs=inputs, input_lengths=input_lengths, answer_ids=answer_ids, answer_mask=answer_mask, teacher_ids=teacher_ids, teacher_logprob=teacher_logps, tail_logprob=teacher_tails, ret_scores=ret_scores, gt=gt, score_func=score_infoseek, tokenizer=processor.tokenizer, tau=1.)
-        if stats_out is not None:
-            cand_tokens,retrieval_sims_raw, teacher_conf_raw,candidate_mask, first_ids_list, first_logp_list, first_tail_list, gt_is_ranked_top, gt_rank, top_weight, merged_score = stats_out
-        else:
-            continue
-        
-        if retrieval_sims_raw.size(0) == 1:
-            continue
-        elif retrieval_sims_raw.std().isnan():
-            continue
 
     from datasets import Features, Sequence, Value 
     features = Features({
         "data_id": Value("string"),
         "cand_tokens": Sequence(Sequence(Value("int64"))),
         "ret_scores": Sequence(Value("float32")),
-        "sum_cand_logps": Sequence(Value("float32")),
-        "candidate_mask": Sequence(Value("bool")),
-        "m_first_tok_id": Sequence(Sequence(Value("int64"))),
-        "m_first_tok_logp": Sequence(Sequence(Value("float32"))),
-        "m_first_tok_tail": Sequence(Value("float32")),
+        #"sum_cand_logps": Sequence(Value("float32")),
+        #"candidate_mask": Sequence(Value("bool")),
+        #"m_first_tok_id": Sequence(Sequence(Value("int64"))),
+        #"m_first_tok_logp": Sequence(Sequence(Value("float32"))),
+        #"m_first_tok_tail": Sequence(Value("float32")),
         "keep": Value("bool"),
         "candidate_gt_rank": Value("int64"),
         "candidate_mass": Value("float32"),
         "gt": Value("string"),
+        "selected_entity": Sequence(Value("string"))
     })
-    
-    train_dl = DataLoader(train_ds, batch_size=1, shuffle=False, collate_fn=collate_train_raw) #, prefetch_factor=2, num_workers=6)
 
-    distil_dataset = HFDataset.from_generator(gen, features=features, gen_kwargs={'input_ds': train_dl, 'processor':processor, 'device': "cpu"})
-    distil_dataset.save_to_disk('/data_external/InfoSeek/distill_train')
+    def gen():
+        mean_rank = []
+        mean_weight = []
+        for batch in train_dl:
+            mean_rank.append(batch['candidate_gt_rank'])
+            mean_weight.append(batch['candidate_mass'])
+            yield batch
+        
+        print("Finished generating DS")
+        print(f"Mean GT rank: {np.mean(mean_rank)}")
+        print(f"Mean GT mass: {np.mean(mean_weight)}")
+    
+    #train_dl = DataLoader(train_ds, batch_size=1, shuffle=False, collate_fn=collate_train_raw) #, prefetch_factor=2, num_workers=6)
+
+    distil_dataset = HFDataset.from_generator(gen, features=features),# gen_kwargs={'input_ds': train_dl, 'processor':processor, 'device': "cpu"})
+    distil_dataset.save_to_disk('/data_external/InfoSeek/distill_withgt')
     return
     # k=30, t=1 avg_w=0.485 avg_topgt_w=0.647 avg_r=1.89
     # k=20, t=1 avg_w=0.514 avg_topgt_w=0.670 avg_r=1.72
