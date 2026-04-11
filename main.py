@@ -65,7 +65,7 @@ HID_LAYER_ID = -1
 EPS = 1e-12
 MACRO_BATCH_SIZE = 16
 LR = args.lr
-
+SLICED_RET = 0
 # =========================
 # Optional: example train step wrapper
 # =========================
@@ -512,6 +512,8 @@ def tokenize_with_none(tokenizer, texts, **tok_kwargs):
     enc = tokenizer(
         valid_texts,
         return_tensors="pt",
+        padding=True,
+        padding_side="right",
         **tok_kwargs,   # e.g. padding=True, truncation=True
     )
 
@@ -661,14 +663,27 @@ def merge_identical_question_answers(
 
     If a question has no valid answers after filtering, it is omitted from the output.
     """
-
+    global SLICED_RET
     if not (
         len(entity) == answer_ids.shape[0] == answer_mask.shape[0]
         == score.shape[0] == invalid_mask.shape[0]
     ):
-        raise ValueError(
-            "Batch dimension mismatch among entity / answer_ids / answer_mask / score / invalid_mask."
-        )
+        if not (answer_ids.shape[0] == answer_mask.shape[0]
+        == score.shape[0] == invalid_mask.shape[0]):
+            # raise ValueError(
+            #     "Batch dimension mismatch among entity / answer_ids / answer_mask / score / invalid_mask."
+            # )
+            if score.shape[0] != answer_ids.shape[0]:
+                score = score[:answer_ids.shape[0]]
+        if len(entity)>answer_ids.shape[0]:
+            SLICED_RET += 1
+            unknown_ent_idx = [i for i, e in enumerate(entity) if e.startswith('unknown')]
+            len_diff = len(entity) - answer_ids.shape[0]
+            to_drop = unknown_ent_idx[-len_diff:]
+            entity = [e for i,e in enumerate(entity) if i not in to_drop]
+
+            if len(entity) > answer_ids.shape[0]:
+                entity = entity[:answer_ids.shape[0]]
 
     if invalid_mask.dtype != torch.bool:
         invalid_mask = invalid_mask.bool()
@@ -796,6 +811,7 @@ def process_ds():
     processor = AutoProcessor.from_pretrained('/data_external/Qwen3-VL-4B-Instruct')
 
     distill_ds = datasets.load_from_disk('/data_external/InfoSeek/distill_train').with_format('torch')
+    #distill_ds = distill_ds.select(range(604000, len(distill_ds)))
     distill_ids = distill_ds['data_id']
     #distill_id_map = {did: i for i, did in enumerate(distill_ids)}
 
@@ -950,11 +966,19 @@ def process_ds():
             tokenizer=processor.tokenizer,
             tau_retrieval=args.ret_tau,
         )
+        if len(merged["selected_entity"]) == 0:
+            return None
         return {'data_id': data_id, 'cand_tokens': merged['selected_answer_ids'], 'ret_scores': merged['selected_score'], 'keep': gt_rank<2, 'candidate_gt_rank':gt_rank, 'candidate_mass': top_weight, 'gt': gt_answer, 'selected_entity': merged['selected_entity']}
         #return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, gt_and_teacher_ids, teacher_logps, teacher_tails, ret_scores, row['answer_eval'], row['data_id']
 
-    train_dl = DataLoader(distill_ds, batch_size=1, shuffle=False, collate_fn=collate_new_distill)
+    
+    train_dl = DataLoader(distill_ds, batch_size=1, shuffle=False, collate_fn=collate_new_distill, prefetch_factor=2, num_workers=12)
 
+    # for i, batch in tqdm(enumerate(train_dl)):
+    #     if batch is None:
+    #         continue
+    #     batch['data_id']
+    # return
     from datasets import Features, Sequence, Value 
     features = Features({
         "data_id": Value("string"),
@@ -975,18 +999,27 @@ def process_ds():
     def gen():
         mean_rank = []
         mean_weight = []
-        for batch in train_dl:
+        mean_sup = []
+        for batch in tqdm(train_dl):
+            if batch is None:
+                continue
             mean_rank.append(batch['candidate_gt_rank'])
             mean_weight.append(batch['candidate_mass'])
+            mean_sup.append(batch['cand_tokens'].size(0))
             yield batch
         
         print("Finished generating DS")
         print(f"Mean GT rank: {np.mean(mean_rank)}")
+        print(f"{np.histogram(mean_rank)}\n")
         print(f"Mean GT mass: {np.mean(mean_weight)}")
+        print(f"{np.histogram(mean_weight)}\n")
+        print(f"Mean support: {np.mean(mean_sup)}")
+        print(f"{np.histogram(mean_sup)}\n")
+        print(f"Number of samples has wrong ret shape: {SLICED_RET}")
     
     #train_dl = DataLoader(train_ds, batch_size=1, shuffle=False, collate_fn=collate_train_raw) #, prefetch_factor=2, num_workers=6)
 
-    distil_dataset = HFDataset.from_generator(gen, features=features),# gen_kwargs={'input_ds': train_dl, 'processor':processor, 'device': "cpu"})
+    distil_dataset = HFDataset.from_generator(gen, features=features)# gen_kwargs={'input_ds': train_dl, 'processor':processor, 'device': "cpu"})
     distil_dataset.save_to_disk('/data_external/InfoSeek/distill_withgt')
     return
     # k=30, t=1 avg_w=0.485 avg_topgt_w=0.647 avg_r=1.89
