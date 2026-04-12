@@ -137,7 +137,7 @@ def train_step(model:WrappedLM, model_config, accelerator:Accelerator, processor
         }
     return stats
 
-def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerator, processor, optimizer,scheduler, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, batch_cand_tokens, ret_scores, sum_cand_logps,m_first_tok_id, m_first_tok_logp, m_first_tok_tail, candidate_mask, mode="seqkd"):
+def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerator, processor, optimizer,scheduler, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, batch_cand_tokens, ret_scores, sum_cand_logps=None,m_first_tok_id=None, m_first_tok_logp=None, m_first_tok_tail=None, candidate_mask=None, mode="seqkd"):
     optimizer.zero_grad(set_to_none=True)
     base_inputs = {k :v.to(device) for k,v in base_inputs.items()}
     input_lengths= input_lengths.to(device)
@@ -168,7 +168,7 @@ def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerato
         # gold_flat = shift_labels[shift_label_mask]               # [N_tokens]
         # logits_flat = shift_logits[shift_label_mask]         # [N_tokens, V]
 
-        kd_loss, ce_loss, valid = model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, m_first_tok_id=m_first_tok_id, m_first_tok_logp=m_first_tok_logp, m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train", mode=mode, add_kl=False, train_base=True)
+        kd_loss, ce_loss, valid = model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, m_first_tok_id=m_first_tok_id, m_first_tok_logp=m_first_tok_logp, m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train", mode=mode, add_kl=False, train_base=False)
 
         loss = kd_loss*KD_WEIGHT + ce_loss * ALPHA_CE# + ft_kl_loss*KL_WEIGHT
         #loss = ce_loss
@@ -1040,11 +1040,20 @@ def process_ds():
 
 def main():
     train_ds = datasets.load_from_disk('/data_external/InfoSeek/train_gen_combined').with_format('torch')
-    train_distill = datasets.load_from_disk('/data_external/InfoSeek/distill_pos').with_format('torch')
+    train_distill = datasets.load_from_disk('/data_external/InfoSeek/distill_train').with_format('torch')
     train_distill = train_distill.filter(lambda x: x['candidate_gt_rank'] == 0)
     #distill_pos = train_distill.filter(lambda x: x['keep'] == True)
-    
-
+    selected_id = train_distill['data_id']
+    distill_new = datasets.load_from_disk('/data_external/InfoSeek/distill_withgt').with_format('torch')
+    dn_idmap = {v: k for k,v in enumerate(distill_new['data_id'])}
+    select_new = []
+    for id in selected_id:
+        try:
+            idx = dn_idmap[id]
+        except KeyError:
+            continue
+        select_new.append(idx)
+    train_distill = distill_new.select(select_new)
     train_ds = train_ds.remove_columns(["per_ev_top_ids", "per_ev_top_logps", "per_ev_tail"])
 
     #train_ds_ids = train_ds['data_id']
@@ -1062,11 +1071,11 @@ def main():
     # UE 54964 , UQ 18656, total 73620
     #test_ds = test_ds.select(range(5000))
 
-    #base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
-    base_model = Qwen3VLForConditionalGeneration.from_pretrained("/data_external/MMPMem/checkpoints/tb_step2000.pt", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
+    base_model = Qwen3VLForConditionalGeneration.from_pretrained("/data_external/Qwen3-VL-4B-Instruct", local_files_only=True, attn_implementation="eager", dtype=torch.bfloat16, device_map='cpu')
+    #base_model = Qwen3VLForConditionalGeneration.from_pretrained("/data_external/MMPMem/checkpoints/tb_step2000.pt", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
 
     for p in base_model.parameters():
-       p.requires_grad_(False)
+      p.requires_grad_(False)
 
     # lora_rank = 540
     # from peft import LoraConfig, get_peft_model, TaskType, PeftModel
@@ -1092,7 +1101,7 @@ def main():
     #base_model = PeftModel.from_pretrained(base_model, "/data_external/MMPMem/checkpoints/lora_step4000.pt/")
     # #base_model = Qwen3VLForConditionalGeneration.from_pretrained("/wyy/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="eager", dtype=torch.float16, device_map='cpu')
 
-    processor = AutoProcessor.from_pretrained('/wyy/models/Qwen3-VL-8B-Instruct')
+    processor = AutoProcessor.from_pretrained('/data_external/Qwen3-VL-4B-Instruct')
 
     memory = MemoryMLP()
     # for p in memory.parameters():
@@ -1131,7 +1140,8 @@ def main():
         question = row['question']
         qimg = row['image']
         answers = row['answer']
-        longest_answers = [max(answer, key=len)+processor.tokenizer.eos_token+'\n' for answer in answers]
+        #longest_answers = [max(answer, key=len)+processor.tokenizer.eos_token+'\n' for answer in answers]
+        longest_answers = distill_row['gt']
         #qid = row['data_id']
 
         inputs, input_lengths, answer_ids, answer_mask, answer_lengths = process_input(processor, question, qimg, longest_answers)
@@ -1145,7 +1155,9 @@ def main():
         # teacher_tails = row['per_ev_tail']
         # ret_scores = row['scores']
         #return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores, row['answer_eval'], row['data_id']
-        return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, row['answer_eval'], row['data_id'], distill_row['cand_tokens'], distill_row['ret_scores'], distill_row['sum_cand_logps'], distill_row['candidate_mask'], distill_row['m_first_tok_id'], distill_row['m_first_tok_logp'], distill_row['m_first_tok_tail'], 
+        cand_tokens =  distill_row['cand_tokens']
+        cand_tokens = [trim_excess_right_padding(e, 151643) for e in cand_tokens]
+        return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, row['answer_eval'], row['data_id'], cand_tokens, distill_row['ret_scores'], #distill_row['sum_cand_logps'], distill_row['candidate_mask'], distill_row['m_first_tok_id'], distill_row['m_first_tok_logp'], distill_row['m_first_tok_tail'], 
 
     def collate_eval(batch):
         row = {k: [e[k] for e in batch] for k in batch[0].keys()}
@@ -1154,8 +1166,8 @@ def main():
         base_inputs = process_input_test(processor, question, qimg).to(model.device)
         return base_inputs, row['answer_eval'], row['data_id']
 
-    train_dl = DataLoader(train_distill, batch_size=MACRO_BATCH_SIZE, shuffle=True, collate_fn=collate_train, num_workers=5, prefetch_factor=2,)
-    
+    train_dl = DataLoader(train_distill, batch_size=MACRO_BATCH_SIZE, shuffle=True, collate_fn=collate_train)#, num_workers=5, prefetch_factor=2,)
+
     #train_dl = DataLoader(train_ds, batch_size=1, shuffle=True, collate_fn=collate_train_raw)
     # import re
     # judge_model = Qwen3ForCausalLM.from_pretrained('/data_external/Qwen3-4B-Instruct-2507', local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16, device_map='cuda')
@@ -1212,14 +1224,14 @@ def main():
         find_unused_parameters=True,
         static_graph=False,
     )
-    accel = Accelerator(kwargs_handlers=[ddp], gradient_accumulation_steps=1)
+    accel = Accelerator(kwargs_handlers=[ddp], gradient_accumulation_steps=1, cpu=True)
     model, optimizer,scheduler, train_dl, test_dl = accel.prepare(model, optimizer, scheduler, train_dl, test_dl)
 
     unw_model = accel.unwrap_model(model)
     _memory = unw_model.memory
     
-    # if accel.is_main_process:
-    #     #wandb_run = wandb.init(project="MMMem", name=f"CEKD_t{args.ret_tau}_k{args.top_k}_listkl_standard_ce_lr{args.lr}")
+    if accel.is_main_process:
+        wandb_run = wandb.init(project="MMMem", name=f"CEKD_t{args.ret_tau}_k{args.top_k}_listkl_standard_ce_lr{args.lr}")
     #     wandb_run = wandb.init(project="MMMem", name=f"train_lora_only")
 
     # accel.wait_for_everyone()
@@ -1267,50 +1279,50 @@ def main():
     #     wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
     accel.wait_for_everyone()
 
-    correct = torch.tensor(0., device=model.device)
-    gathered_results_mix = []
-    print('UE')
-    with torch.inference_mode():
-        #for lam in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
-            correct = torch.tensor(0., device=model.device)
-            for row in tqdm(test_dl):
-                inputs, gts, data_ids = row
-                output_ids = unw_model.generate(**inputs, mix_mode='base', mix_lambda=0.6, branch="generation")
-                input_len = inputs.input_ids.size(1)
-                generated_ids = output_ids[:, input_len:]
-                text = processor.batch_decode(generated_ids, skip_special_tokens=True)
+    # correct = torch.tensor(0., device=model.device)
+    # gathered_results_mix = []
+    # print('UE')
+    # with torch.inference_mode():
+    #     #for lam in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+    #         correct = torch.tensor(0., device=model.device)
+    #         for row in tqdm(test_dl):
+    #             inputs, gts, data_ids = row
+    #             output_ids = unw_model.generate(**inputs, mix_mode='base', mix_lambda=0.6, branch="generation")
+    #             input_len = inputs.input_ids.size(1)
+    #             generated_ids = output_ids[:, input_len:]
+    #             text = processor.batch_decode(generated_ids, skip_special_tokens=True)
 
-                local_results = []
-                for gt, pred, did in zip(gts, text, data_ids):
-                    if '{' in gt[0] and '}' in gt[0]:
-                        gt = ast.literal_eval(gt[0])
-                    score_m = score_infoseek(pred, gt)
-                    correct += score_m['acc']
-                    local_results.append({"score": 1 if score_m['acc']>0 else 0, "data_id": did, 'gt': gt, 'pred': pred})
+    #             local_results = []
+    #             for gt, pred, did in zip(gts, text, data_ids):
+    #                 if '{' in gt[0] and '}' in gt[0]:
+    #                     gt = ast.literal_eval(gt[0])
+    #                 score_m = score_infoseek(pred, gt)
+    #                 correct += score_m['acc']
+    #                 local_results.append({"score": 1 if score_m['acc']>0 else 0, "data_id": did, 'gt': gt, 'pred': pred})
 
-                # gathered = accel.gather_for_metrics(
-                #     local_results,
-                #     use_gather_object=True,
-                # )
-                # if accel.is_main_process:
-                #     # Normalize in case the gathered structure is nested by rank
-                #     if len(gathered) > 0 and isinstance(gathered[0], list):
-                #         gathered = [x for chunk in gathered for x in chunk]
-                #     gathered_results_mix.extend(gathered)
+    #             # gathered = accel.gather_for_metrics(
+    #             #     local_results,
+    #             #     use_gather_object=True,
+    #             # )
+    #             # if accel.is_main_process:
+    #             #     # Normalize in case the gathered structure is nested by rank
+    #             #     if len(gathered) > 0 and isinstance(gathered[0], list):
+    #             #         gathered = [x for chunk in gathered for x in chunk]
+    #             #     gathered_results_mix.extend(gathered)
 
-            accel.wait_for_everyone()
-            correct = accel.reduce(correct, reduction="sum")
-            if accel.is_main_process:
-                correct = correct.item()
-                #gathered_results_mix.sort(key=lambda x: x["data_id"])
-                #print(f'Lambda: {lam}')
-                print(correct)
-                print(correct / len(test_ds))
-                print()
-                #wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
-            accel.wait_for_everyone()
+    #         accel.wait_for_everyone()
+    #         correct = accel.reduce(correct, reduction="sum")
+    #         if accel.is_main_process:
+    #             correct = correct.item()
+    #             #gathered_results_mix.sort(key=lambda x: x["data_id"])
+    #             #print(f'Lambda: {lam}')
+    #             print(correct)
+    #             print(correct / len(test_ds))
+    #             print()
+    #             #wandb_run.log({'eval/acc': correct/1000, 'eval/epoch': 0})
+    #         accel.wait_for_everyone()
     #torch.save(gathered_results_mix, "/latent_aug/MMPMem/best_result_base_ue.pt")
-    return
+    #return
     # torch.save([gathered_results_base, gathered_results_mix], "/latent_aug/MMPMem/result_analy_ue.pt")
 
     # unseen question 
@@ -1343,9 +1355,10 @@ def main():
         support = 0
         for step, batch in enumerate(train_dl):
             #inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores = batch
-            inputs, input_lengths, answer_ids, answer_mask, answer_lengths, answer_eval, data_id, cand_tokens, ret_scores, sum_cand_logps, candidate_mask, m_first_tok_id, m_first_tok_logp, m_first_tok_tail = batch
+            #inputs, input_lengths, answer_ids, answer_mask, answer_lengths, answer_eval, data_id, cand_tokens, ret_scores#, sum_cand_logps, candidate_mask, m_first_tok_id, m_first_tok_logp, m_first_tok_tail = batch
+            inputs, input_lengths, answer_ids, answer_mask, answer_lengths, answer_eval, data_id, cand_tokens, ret_scores = batch
             #stats = train_step(model,unw_model.config, accel, processor, optimizer,scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  teacher_ids, teacher_logps, teacher_tails, ret_scores)
-            stats = train_step_temperature(model,unw_model.config, accel, processor, optimizer, scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  cand_tokens, ret_scores, sum_cand_logps,m_first_tok_id, m_first_tok_logp, m_first_tok_tail, candidate_mask, mode="listkl")
+            stats = train_step_temperature(model,unw_model.config, accel, processor, optimizer, scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  cand_tokens, ret_scores, mode="seqkd")
             
             acc_loss.append(stats['loss'])
             cur_loss = np.mean(acc_loss)
@@ -1461,5 +1474,5 @@ def set_determinism(seed):
 
 if __name__ == "__main__":
     set_determinism(2026)
-    #main()
-    process_ds()
+    main()
+    #process_ds()

@@ -638,7 +638,7 @@ class WrappedLM(nn.Module, GenerationMixin):
 
 
         assert len(batch_cand_tokens) == B
-        assert len(sum_cand_logps) == B
+        #assert len(sum_cand_logps) == B
 
         # Extract top-1 realized sequences (index 0) per example
         kd_losses: List[torch.Tensor] = []
@@ -648,21 +648,22 @@ class WrappedLM(nn.Module, GenerationMixin):
         valid_mask = torch.ones([B], dtype=torch.bfloat16, device=device)
         for b in range(B):
             sample_cand_token = batch_cand_tokens[b]
+            cand_tokens = sample_cand_token
             sample_ret_score = ret_scores[b]
-            sample_candidate_mask = candidate_mask[b]
-            sample_teacher_conf = sum_cand_logps[b]
+            #sample_candidate_mask = candidate_mask[b]
+            #sample_teacher_conf = sum_cand_logps[b]
 
-            cand_tokens, logw, merged_score = merge_candidates_with_temperature(
-                cand_tokens=sample_cand_token,
-                retrieval_sims_raw=sample_ret_score,
-                teacher_conf_raw=None, #sample_teacher_conf,
-                candidate_mask=sample_candidate_mask,
-                pad_id=pad_id,
-                eos_id=eos_id,
-                tau_retrieval=tau_retrieval,
-                tau_teacher=tau_teacher,
-                top_k=top_k
-            )
+            # cand_tokens, logw, merged_score = merge_candidates_with_temperature(
+            #     cand_tokens=sample_cand_token,
+            #     retrieval_sims_raw=sample_ret_score,
+            #     teacher_conf_raw=None, #sample_teacher_conf,
+            #     candidate_mask=sample_candidate_mask,
+            #     pad_id=pad_id,
+            #     eos_id=eos_id,
+            #     tau_retrieval=tau_retrieval,
+            #     tau_teacher=tau_teacher,
+            #     top_k=top_k
+            # )
 
             if add_kl:
                 candidate_log_weights=sample_ret_score/float(tau_retrieval)
@@ -675,7 +676,7 @@ class WrappedLM(nn.Module, GenerationMixin):
                 print("Empty candidate batch")
                 continue
 
-            cand_tokens = trim_excess_right_padding(cand_tokens, pad_id)
+            #cand_tokens = trim_excess_right_padding(cand_tokens, pad_id)
 
             # Student conditioned on ORIGINAL image+question for sample b
             student_seq_logp, prompt_cache_return, logp_first_dist, prompt_position_ids = self.compute_student_seq_logp_qwen3vl(
@@ -713,6 +714,9 @@ class WrappedLM(nn.Module, GenerationMixin):
                 train_base=train_base,
                 )
             
+            sample_ret_score = sample_ret_score/tau_retrieval
+            logZ = torch.logsumexp(sample_ret_score, dim=0)
+            logw = sample_ret_score - logZ
             if logw.size(0) > 1:
 
                 if add_kl:
