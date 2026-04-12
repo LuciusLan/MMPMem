@@ -156,7 +156,7 @@ for step,row in enumerate(test_ds):
     inputs = process_prompt(row)
     inputs = inputs.to('cuda')
     with torch.inference_mode():
-        output_ids = model.generate(**inputs, mix_mode='base', mix_lambda=lam, branch="generation")
+        output_ids = model.generate(**inputs, mix_mode='base', mix_lambda=0.8, branch="generation")
         input_len = inputs.input_ids.size(1)
         generated_ids = output_ids[:, input_len:]
         text = processor.decode(generated_ids, skip_special_tokens=True)[0]

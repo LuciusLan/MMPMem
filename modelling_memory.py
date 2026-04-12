@@ -9,7 +9,7 @@ from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.generation import GenerationMixin
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, is_torchdynamo_compiling
-from transformers import Qwen3VLForConditionalGeneration
+from transformers import Qwen3VLForConditionalGeneration, Qwen3VLModel, Qwen3VLTextModel
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLCausalLMOutputWithPast, Qwen3VLModelOutputWithPast
 
 from seq_kd_utils import _slice_text_batch_to_single, _split_visual_inputs_qwen3vl_by_sample, _compact_right_pad_or_left_pad, token_mask_right_padded, _repeat_dynamic_cache, build_prompt_only_masks, merge_candidates_with_temperature, marginalize_first_token_logp_topk, trim_excess_right_padding, seq_kd_loss_from_seq_logp, mml_loss_from_seq_logp, sparse_kl_with_tail, clone_past_key_values
@@ -65,7 +65,8 @@ class MemoryMLP(nn.Module):
     # Bind LM head with base LM head
 
     #def __init__(self, d_in=4096, d_up=8192, num_blocks=6, vocab_size=151936,
-    def __init__(self, d_in=4096, d_up=14336, num_blocks=4, vocab_size=151936,
+    #def __init__(self, d_in=4096, d_up=14336, num_blocks=4, vocab_size=151936,
+    def __init__(self, d_in=4096, d_up=6400, num_blocks=8, vocab_size=151936,
                  head='dense', head_rank=4096, norm='rms'):
         super().__init__()
         self.blocks = nn.ModuleList([MemBlock(d_in, d_up, norm=norm) for _ in range(num_blocks)])
@@ -99,8 +100,10 @@ class WrappedLM(nn.Module, GenerationMixin):
 
     def __init__(self, base_model: Qwen3VLForConditionalGeneration, memory: MemoryMLP, config, processor, layer_idx_for_mem=32):
         super().__init__()
+        self.base_model = base_model
         self.base_lm = base_model
-        self.base_model = base_model.model
+        self.base_lm_model=base_model.model
+        #self.base_lm_model: Qwen3VLModel = base_model.base_model.model.model
         self.lm_head = base_model.lm_head
         self.memory = memory
         self.layer_idx_for_mem = layer_idx_for_mem
@@ -116,16 +119,16 @@ class WrappedLM(nn.Module, GenerationMixin):
 
     @property
     def device(self) -> torch.device:
-        return self.base_model.device
+        return self.base_lm_model.device
     
     def prepare_inputs_for_generation(self, *args, **kwargs):
         return self.base_lm.prepare_inputs_for_generation(*args, **kwargs)
 
     def get_output_embeddings(self):
-        return self.base_model.get_output_embeddings()
+        return self.base_lm_model.get_output_embeddings()
 
     def get_input_embeddings(self):
-        return self.base_model.get_input_embeddings()
+        return self.base_lm_model.get_input_embeddings()
 
     def _update_model_kwargs_for_generation(
         self,
@@ -189,22 +192,22 @@ class WrappedLM(nn.Module, GenerationMixin):
         latent_token_mask = kwargs.pop("latent_token_mask", None)
 
         if pixel_values is not None:
-            image_outputs = self.base_model.get_image_features(
+            image_outputs = self.base_lm_model.get_image_features(
                 pixel_values, image_grid_thw, return_dict=True
             )
             image_embeds = image_outputs.pooler_output
             deepstack_image_embeds = image_outputs.deepstack_features
             #image_embeds_return = [e.clone() for e in image_embeds]
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.base_model.get_placeholder_mask(
+            image_mask, _ = self.base_lm_model.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
-            video_embeds, deepstack_video_embeds = self.base_model.get_video_features(pixel_values_videos, video_grid_thw)
+            video_embeds, deepstack_video_embeds = self.base_lm_model.get_video_features(pixel_values_videos, video_grid_thw)
             video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.base_model.get_placeholder_mask(
+            _, video_mask = self.base_lm_model.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
@@ -234,7 +237,7 @@ class WrappedLM(nn.Module, GenerationMixin):
             deepstack_visual_embeds = deepstack_video_embeds
 
         if position_ids is None:
-            position_ids = self.base_lm.model.compute_3d_position_ids(
+            position_ids = self.base_lm_model.compute_3d_position_ids(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
@@ -251,7 +254,7 @@ class WrappedLM(nn.Module, GenerationMixin):
                 text_pos = (text_pos - (L - prefix_lens)).clamp_min(0).unsqueeze(0)
                 position_ids = torch.cat([text_pos,position_ids], dim=0)
         
-        outputs:Qwen3VLModelOutputWithPast = self.base_model.language_model(
+        outputs:Qwen3VLModelOutputWithPast = self.base_lm_model.language_model(
             input_ids=None,
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -646,6 +649,7 @@ class WrappedLM(nn.Module, GenerationMixin):
         valid_mask = torch.ones([B], dtype=torch.bfloat16, device=device)
         for b in range(B):
             sample_cand_token = batch_cand_tokens[b]
+            cand_tokens = sample_cand_token
             sample_ret_score = ret_scores[b]
             sample_candidate_mask = candidate_mask[b]
             if sum_cand_logps is not None:
@@ -653,17 +657,17 @@ class WrappedLM(nn.Module, GenerationMixin):
             else:
                 sample_teacher_conf = None
 
-            cand_tokens, logw, merged_score = merge_candidates_with_temperature(
-                cand_tokens=sample_cand_token,
-                retrieval_sims_raw=sample_ret_score,
-                teacher_conf_raw=None, #sample_teacher_conf,
-                candidate_mask=sample_candidate_mask,
-                pad_id=pad_id,
-                eos_id=eos_id,
-                tau_retrieval=tau_retrieval,
-                tau_teacher=tau_teacher,
-                top_k=top_k
-            )
+            # cand_tokens, logw, merged_score = merge_candidates_with_temperature(
+            #     cand_tokens=sample_cand_token,
+            #     retrieval_sims_raw=sample_ret_score,
+            #     teacher_conf_raw=None, #sample_teacher_conf,
+            #     candidate_mask=sample_candidate_mask,
+            #     pad_id=pad_id,
+            #     eos_id=eos_id,
+            #     tau_retrieval=tau_retrieval,
+            #     tau_teacher=tau_teacher,
+            #     top_k=top_k
+            # )
 
             if add_kl:
                 candidate_log_weights=sample_ret_score/float(tau_retrieval)
@@ -676,7 +680,7 @@ class WrappedLM(nn.Module, GenerationMixin):
                 print("Empty candidate batch")
                 continue
 
-            cand_tokens = trim_excess_right_padding(cand_tokens, pad_id)
+            #cand_tokens = trim_excess_right_padding(cand_tokens, pad_id)
 
             # Student conditioned on ORIGINAL image+question for sample b
             student_seq_logp, prompt_cache_return, logp_first_dist, prompt_position_ids = self.compute_student_seq_logp_qwen3vl(
@@ -714,6 +718,9 @@ class WrappedLM(nn.Module, GenerationMixin):
                 train_base=train_base,
                 )
             
+            sample_ret_score = sample_ret_score/tau_retrieval
+            logZ = torch.logsumexp(sample_ret_score, dim=0)
+            logw = sample_ret_score - logZ
             if logw.size(0) > 1:
 
                 if add_kl:
@@ -844,7 +851,7 @@ class WrappedLM(nn.Module, GenerationMixin):
                 mode = "mml"
             out = self.compute_loss_premerged_with_ce(
             model_config=model_config, prompt_inputs=prompt_inputs, label_mask=label_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, m_first_tok_id=m_first_tok_id,m_first_tok_logp=m_first_tok_logp, 
-            m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=self.pad_token_id, eos_id=self.eos_token_id, detach_prompt_cache=detach_prompt_cache, tau_retrieval=tau_retrieval, top_k=top_k, chunk_size=10, mode=mode, add_kl=add_kl,train_base=train_base
+            m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=self.pad_token_id, eos_id=self.eos_token_id, detach_prompt_cache=detach_prompt_cache, tau_retrieval=tau_retrieval, top_k=top_k, chunk_size=20, mode=mode, add_kl=add_kl,train_base=train_base
         )
         
         return out

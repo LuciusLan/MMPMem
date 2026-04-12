@@ -13,7 +13,7 @@ from transformers.modeling_outputs import ModelOutput
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 from transformers.cache_utils import Cache
-from transformers.utils.generic import check_model_inputs
+#from transformers.utils.generic import check_model_inputs
 from qwen_vl_utils.vision_process import process_vision_info
 
 logger = logging.getLogger(__name__)
@@ -247,7 +247,7 @@ class Qwen3VLEmbedder():
                     **video_kwargs
                 })
 
-        if image:
+        if image is not None:
             image_content = None
             if isinstance(image, Image.Image):
                 image_content = image
@@ -257,7 +257,7 @@ class Qwen3VLEmbedder():
                 raise TypeError(f"Unrecognized image type: {type(image)}")
 
             # Add image input details to content
-            if image_content:
+            if image_content is not None:
                 content.append({
                     'type': 'image', 'image': image_content,
                     "min_pixels": self.min_pixels,

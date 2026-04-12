@@ -28,6 +28,7 @@ import json
 import math
 import random
 from dataclasses import dataclass
+from collections import Counter, defaultdict, OrderedDict
 import time
 
 import numpy as np
@@ -52,7 +53,7 @@ from accelerate.utils import tqdm
 from modelling_memory import MemoryMLP, WrappedLM
 from inference import generate_with_memory
 from eval_util import score_infoseek
-from seq_kd_utils import compute_seqkd_or_mml_loss, extract_top1_sequences_and_logp, compute_candidate_log_weights_for_cache, label_candidate
+from seq_kd_utils import compute_seqkd_or_mml_loss, extract_top1_sequences_and_logp, compute_candidate_log_weights_for_cache, label_candidate, trim_excess_right_padding
 
 # ---------------------------
 # Hyperparameters & utilities
@@ -64,9 +65,9 @@ KL_WEIGHT = 0.3
 USE_RESIDUAL = False       # if True: memory learns residual logits; else memory outputs a dist directly
 HID_LAYER_ID = -1
 EPS = 1e-12
-MACRO_BATCH_SIZE = 8
+MACRO_BATCH_SIZE = 16
 LR = args.lr
-
+SLICED_RET = 0
 # =========================
 # Optional: example train step wrapper
 # =========================
@@ -138,7 +139,7 @@ def train_step(model:WrappedLM, model_config, accelerator:Accelerator, processor
         }
     return stats
 
-def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerator, processor, optimizer,scheduler, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, batch_cand_tokens, ret_scores, sum_cand_logps,m_first_tok_id, m_first_tok_logp, m_first_tok_tail, candidate_mask, mode="seqkd"):
+def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerator, processor, optimizer,scheduler, device, base_inputs: BatchFeature, input_lengths:torch.Tensor, answer_ids:torch.Tensor,  answer_mask:torch.Tensor, batch_cand_tokens, ret_scores, sum_cand_logps=None,m_first_tok_id=None, m_first_tok_logp=None, m_first_tok_tail=None, candidate_mask=None, mode="seqkd"):
     optimizer.zero_grad(set_to_none=True)
     base_inputs = {k :v.to(device) for k,v in base_inputs.items()}
     input_lengths= input_lengths.to(device)
@@ -169,7 +170,7 @@ def train_step_temperature(model:WrappedLM, model_config, accelerator:Accelerato
         # gold_flat = shift_labels[shift_label_mask]               # [N_tokens]
         # logits_flat = shift_logits[shift_label_mask]         # [N_tokens, V]
 
-        kd_loss, ce_loss, valid = model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, m_first_tok_id=m_first_tok_id, m_first_tok_logp=m_first_tok_logp, m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train", mode=mode, add_kl=False, train_base=True)
+        kd_loss, ce_loss, valid = model(model_config=model_config, prompt_inputs=base_inputs, label_mask=answer_mask, answer_ids=answer_ids, batch_cand_tokens=batch_cand_tokens, ret_scores=ret_scores, sum_cand_logps=sum_cand_logps, m_first_tok_id=m_first_tok_id, m_first_tok_logp=m_first_tok_logp, m_first_tok_tail=m_first_tok_tail, candidate_mask=candidate_mask, pad_id=processor.tokenizer.pad_token_id, eos_id=processor.tokenizer.eos_token_id, detach_prompt_cache=True, tau_retrieval=args.ret_tau, top_k=args.top_k, branch="train", mode=mode, add_kl=False, train_base=False)
 
         loss = kd_loss*KD_WEIGHT + ce_loss * ALPHA_CE# + ft_kl_loss*KL_WEIGHT
         #loss = ce_loss
@@ -246,7 +247,6 @@ def get_stats_step(model:WrappedLM, processor, device, base_inputs: BatchFeature
         candidate_mask = torch.isfinite(retrieval_sims)
 
         cand_texts = processor.batch_decode(cand_tokens, skip_special_tokens=True)
-
         counts_mask = (cand_tokens == 151643).sum(dim=1)
         cand_length = cand_tokens.size(1) - counts_mask
         has_abst = torch.tensor([_contains_abstention(e, _ABSTENTION_PATTERNS) for e in cand_texts], dtype=torch.bool)
@@ -493,6 +493,294 @@ def process_teacher_batch(mix_idx, mix_logp, tail_logp, answer_lengths:list[int]
         tail_logprob[i, :La] = taillogp
     return teacher_ids_with, teacher_logprob_with, tail_logprob
 
+def tokenize_with_none(tokenizer, texts, **tok_kwargs):
+    # texts: list[str | None]
+
+    if tokenizer.pad_token_id is None:
+        # common fallback for decoder-only tokenizers
+        tokenizer.pad_token = tokenizer.eos_token
+
+    valid_idx = [i for i, t in enumerate(texts) if t is not None]
+    valid_texts = [texts[i] for i in valid_idx]
+
+    if len(valid_texts) == 0:
+        # choose a width explicitly if you need nonzero sequence length
+        max_len = tok_kwargs.get("max_length", 0)
+        return {
+            "input_ids": torch.full((len(texts), max_len), tokenizer.pad_token_id, dtype=torch.long),
+            "attention_mask": torch.zeros((len(texts), max_len), dtype=torch.long),
+        }
+
+    enc = tokenizer(
+        valid_texts,
+        return_tensors="pt",
+        padding=True,
+        padding_side="right",
+        **tok_kwargs,   # e.g. padding=True, truncation=True
+    )
+
+    B = len(texts)
+    L = enc["input_ids"].shape[1]
+
+    out = {
+        "input_ids": torch.full((B, L), tokenizer.pad_token_id, dtype=enc["input_ids"].dtype),
+        "attention_mask": torch.zeros((B, L), dtype=enc["attention_mask"].dtype),
+    }
+
+    if "token_type_ids" in enc:
+        pad_ttype = getattr(tokenizer, "pad_token_type_id", 0)
+        if pad_ttype is None:
+            pad_ttype = 0
+        out["token_type_ids"] = torch.full((B, L), pad_ttype, dtype=enc["token_type_ids"].dtype)
+
+    j = 0
+    for i, t in enumerate(texts):
+        if t is not None:
+            out["input_ids"][i] = enc["input_ids"][j]
+            out["attention_mask"][i] = enc["attention_mask"][j]
+            if "token_type_ids" in enc:
+                out["token_type_ids"][i] = enc["token_type_ids"][j]
+            j += 1
+
+    return out
+
+def merge_rows_from_tok_or_original(
+    original_tensor,          # [B, L_orig]
+    original_attention_mask,  # [B, L_orig]
+    tok_ids_with_none,        # [B, L_tok]
+    tok_attention_mask,       # [B, L_tok]
+    pad_id=0,
+):
+    B, L_orig = original_tensor.shape
+    B2, L_tok = tok_ids_with_none.shape
+    if B2 > B:
+        tok_ids_with_none = tok_ids_with_none[:B, :]
+        tok_attention_mask = tok_attention_mask[:B, :]
+
+    use_tok = tok_attention_mask.any(dim=1)   # [B]
+
+    L_out = max(L_orig, L_tok)
+
+    original_padded = F.pad(original_tensor, (0, L_out - L_orig), value=pad_id)
+    original_mask_padded = F.pad(original_attention_mask, (0, L_out - L_orig), value=0)
+
+    tok_padded = F.pad(tok_ids_with_none, (0, L_out - L_tok), value=pad_id)
+    tok_mask_padded = F.pad(tok_attention_mask, (0, L_out - L_tok), value=0)
+
+    merged = torch.where(use_tok[:, None], tok_padded, original_padded)
+    merged_attention_mask = torch.where(
+        use_tok[:, None],
+        tok_mask_padded,
+        original_mask_padded,
+    )
+
+    return merged, merged_attention_mask
+
+def append_eos_to_padded(
+    original_tensor,          # [B, L]
+    original_attention_mask,  # [B, L], 1 for real tokens, 0 for pad
+    eos_id,
+    pad_id,
+):
+    B, L = original_tensor.shape
+
+    lengths = original_attention_mask.sum(dim=1)   # [B]
+    need_extend = bool((lengths == L).any())
+    L_new = L + 1 if need_extend else L
+
+    out = torch.full(
+        (B, L_new),
+        pad_id,
+        dtype=original_tensor.dtype,
+        device=original_tensor.device,
+    )
+    out[:, :L] = original_tensor
+
+    out_mask = torch.zeros(
+        (B, L_new),
+        dtype=original_attention_mask.dtype,
+        device=original_attention_mask.device,
+    )
+    out_mask[:, :L] = original_attention_mask
+
+    row_idx = torch.arange(B, device=original_tensor.device)
+    out[row_idx, lengths] = eos_id
+    out_mask[row_idx, lengths] = 1
+
+    return out, out_mask
+
+def _answer_key_from_mask(answer_ids_row: torch.Tensor,
+                          answer_mask_row: torch.Tensor):
+    # exact token identity over the non-pad region only
+    return tuple(answer_ids_row[answer_mask_row.bool()].tolist())
+
+
+def _merge_ppl_score(ppl_values: torch.Tensor, mode: str = "sum") -> torch.Tensor:
+    """
+    Returns a scalar score where lower is better.
+
+    Supported modes:
+      - "mean":
+            arithmetic mean of perplexities.
+      - "inv_logsumexp":
+            score = -log(sum_i 1 / ppl_i)
+            This is not a true perplexity; it is a duplicate-favoring score.
+            Repeated identical answers reduce the score and thus help them win.
+      - "min":
+            minimum perplexity in the group.
+    """
+    v = ppl_values.float()
+    if (v <= 0).any():
+        raise ValueError("Perplexities must be strictly positive.")
+
+    if mode == "mean":
+        return v.mean()
+
+    elif mode == "sum":
+        # lower is better
+        # equivalent to aggregating pseudo-support proportional to 1/ppl
+        #return -torch.logsumexp(-torch.log(v), dim=0)
+        return v.sum()
+
+    elif mode == "min":
+        return v.min()
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+    
+def merge_identical_question_answers(
+    entity: List[str],               # length B
+    answer_ids: torch.Tensor,           # [B, L]
+    answer_mask: torch.Tensor,          # [B, L]
+    score: torch.Tensor,                  # [B]
+    invalid_mask: torch.Tensor,         # [B], True = valid, False = invalid
+    merge_mode: str = "sum",
+) -> Dict[str, Any]:
+    """
+    For each exact question string:
+      0) discard invalid rows using invalid_mask (True = valid),
+      1) group identical answers,
+      2) merge their perplexities,
+      3) keep the answer-group with the lowest merged score.
+
+    If a question has no valid answers after filtering, it is omitted from the output.
+    """
+    global SLICED_RET
+    if not (
+        len(entity) == answer_ids.shape[0] == answer_mask.shape[0]
+        == score.shape[0] == invalid_mask.shape[0]
+    ):
+        if not (answer_ids.shape[0] == answer_mask.shape[0]
+        == score.shape[0] == invalid_mask.shape[0]):
+            # raise ValueError(
+            #     "Batch dimension mismatch among entity / answer_ids / answer_mask / score / invalid_mask."
+            # )
+            if score.shape[0] != answer_ids.shape[0]:
+                score = score[:answer_ids.shape[0]]
+        if len(entity)>answer_ids.shape[0]:
+            SLICED_RET += 1
+            unknown_ent_idx = [i for i, e in enumerate(entity) if e.startswith('unknown')]
+            len_diff = len(entity) - answer_ids.shape[0]
+            to_drop = unknown_ent_idx[-len_diff:]
+            entity = [e for i,e in enumerate(entity) if i not in to_drop]
+
+            if len(entity) > answer_ids.shape[0]:
+                entity = entity[:answer_ids.shape[0]]
+
+    if invalid_mask.dtype != torch.bool:
+        invalid_mask = invalid_mask.bool()
+
+    B = len(entity)
+
+    # Keep only valid rows. Note: despite the name, True means valid.
+    valid_row_indices = [i for i in range(B) if not bool(invalid_mask[i].item())]
+
+    selected_entity = []
+    selected_rep_row_idx = []
+    selected_group_size = []
+    selected_member_indices = []
+    selected_score = []
+
+    per_entity_details = OrderedDict()
+
+    # Preserve first-seen order among valid rows only
+    entity_to_indices = OrderedDict()
+    for i in valid_row_indices:
+        q = entity[i]
+        entity_to_indices.setdefault(q, []).append(i)
+
+    for q, q_idxs in entity_to_indices.items():
+        # Group rows with the same exact answer tokens
+        answer_groups = OrderedDict()
+        for i in q_idxs:
+            ans_key = _answer_key_from_mask(answer_ids[i], answer_mask[i])
+            answer_groups.setdefault(ans_key, []).append(i)
+
+        candidates = []
+        for ans_key, member_idxs in answer_groups.items():
+            idx_tensor = torch.tensor(member_idxs, device=score.device, dtype=torch.long)
+            merged_score = _merge_ppl_score(score.index_select(0, idx_tensor), mode=merge_mode)
+
+            rep_idx = member_idxs[0]   # any member is fine; valid tokens are identical
+            candidates.append({
+                "answer_key": ans_key,
+                "member_indices": member_idxs,
+                "group_size": len(member_idxs),
+                "rep_idx": rep_idx,
+                "score": merged_score,
+            })
+
+        if len(candidates) == 0:
+            # all rows for this entity were invalid; skip
+            continue
+
+        best = min(candidates, key=lambda x: float(x["score"].detach().cpu()))
+
+        selected_entity.append(q)
+        selected_rep_row_idx.append(best["rep_idx"])
+        selected_group_size.append(best["group_size"])
+        selected_member_indices.append(best["member_indices"])
+        selected_score.append(best["score"])
+
+        per_entity_details[q] = [
+            {
+                "rep_idx": c["rep_idx"],
+                "member_indices": c["member_indices"],
+                "group_size": c["group_size"],
+                "score": float(c["score"].detach().cpu()),
+            }
+            for c in candidates
+        ]
+
+    if len(selected_rep_row_idx) == 0:
+        return {
+            "selected_entity": [],
+            "selected_answer_ids": answer_ids[:0],
+            "selected_answer_mask": answer_mask[:0],
+            "selected_score": score[:0].float(),
+            "selected_rep_row_idx": [],
+            "selected_group_size": [],
+            "selected_member_indices": [],
+            "per_entity_details": per_entity_details,
+        }
+
+    keep_idx = torch.tensor(selected_rep_row_idx, device=answer_ids.device, dtype=torch.long)
+
+    selected_answer_ids = answer_ids.index_select(0, keep_idx)
+    selected_answer_mask = answer_mask.index_select(0, keep_idx)
+    selected_score = torch.stack(selected_score)
+
+    return {
+        "selected_entity": selected_entity,
+        "selected_answer_ids": selected_answer_ids,
+        "selected_answer_mask": selected_answer_mask,
+        "selected_score": selected_score,                 # lower is better
+        "selected_rep_row_idx": selected_rep_row_idx,
+        "selected_group_size": selected_group_size,
+        "selected_member_indices": selected_member_indices,
+        "per_entity_details": per_entity_details,
+    }
+
 
 def gen(input_ds, processor, device):
     pbar = tqdm(total=len(input_ds))
@@ -517,10 +805,56 @@ def gen(input_ds, processor, device):
         sample = {'data_id':data_id[0], 'cand_tokens': cand_tokens, 'ret_scores': retrieval_sims_raw, "sum_cand_logps": teacher_conf_raw.squeeze(0), "candidate_mask":candidate_mask.squeeze(0), 'm_first_tok_id': first_ids_list, 'm_first_tok_logp':first_logp_list, 'm_first_tok_tail': first_tail_list, "keep": gt_is_ranked_top, "candidate_gt_rank": gt_rank, "candidate_mass":top_weight, "gt": str(gt)}
         yield sample
 
+
 def process_ds():
     train_ds = datasets.load_from_disk('/data_external/InfoSeek/train_gen_combined').with_format('torch')
+    train_id_map = {tid: i for i, tid in enumerate(train_ds['data_id'])}
     #train_ds = train_ds.remove_columns(["per_ev_top_ids", "per_ev_top_logps", "per_ev_tail"])
-    processor = AutoProcessor.from_pretrained('/wyy/models/Qwen3-VL-8B-Instruct')
+    processor = AutoProcessor.from_pretrained('/data_external/Qwen3-VL-4B-Instruct')
+
+    distill_ds = datasets.load_from_disk('/data_external/InfoSeek/distill_train').with_format('torch')
+    #distill_ds = distill_ds.select(range(604000, len(distill_ds)))
+    distill_ids = distill_ds['data_id']
+    #distill_id_map = {did: i for i, did in enumerate(distill_ids)}
+
+    with open('/data_external/InfoSeek/infoseek_train.jsonl') as f:
+        train = [json.loads(e) for e in f.readlines()]
+
+    train_questions = [e['question'] for e in train]
+    train_oven_ids = [e['image_id'] for e in train]
+    count_tq = Counter(train_questions)
+    #coun_tq = {k: v for k,v in count_tq.items()}
+
+    with open('/data_external/InfoSeek/query_ret_imgs_qwen.jsonl') as f:
+        ret_images = [json.loads(e) for e in f.readlines()]
+
+    with open("/data_external/InfoSeek/oven_entity_train.jsonl") as f:
+        oven = f.readlines()
+        oven = [json.loads(e) for e in tqdm(oven)]
+    with open("/data_external/InfoSeek/oven_entity_val.jsonl") as f:
+        temp = f.readlines()
+        temp = [json.loads(e) for e in temp]
+    oven.extend(temp)
+    oven_image_id_entity_map = {e['image_id']:e['entity_text'] for e in tqdm(oven)}
+
+
+    train_entities = [oven_image_id_entity_map[id] for id in train_oven_ids]
+    train_entities_unique = set(train_entities)
+    train_query_entity_map = defaultdict(set)
+    train_entity_query_map = defaultdict(set)
+    train_qe_combination_to_answer = defaultdict(str)
+
+    train_ent_query_combinations = []
+    for row in tqdm(train):
+        ent = oven_image_id_entity_map[row['image_id']]
+        train_query_entity_map[ent].add(row['question'])
+        train_entity_query_map[row['question']].add(ent)
+        train_ent_query_combinations.append(f'{ent}|{row["question"]}')
+        if len(train_qe_combination_to_answer[f'{ent}|{row["question"]}']) == 0:
+            train_qe_combination_to_answer[f'{ent}|{row["question"]}'] = row['answer']
+
+    #count_ent_qs = Counter(train_ent_query_combinations)
+
     def collate_train_raw(batch):
         row = {k: [e[k] for e in batch] for k in batch[0].keys()}
         question = row['question']
@@ -539,26 +873,156 @@ def process_ds():
         ret_scores = row['scores']
         return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores, row['answer_eval'], row['data_id']
 
+    def collate_new_distill(batch):
+        assert len(batch) == 1
+        dis_row = batch[0]
+        data_id = dis_row['data_id']
+        data_id_int = int(data_id.split('_')[-1])
+        train_idx = train_id_map[data_id]
+        row_train = train_ds[train_idx]
+        row_ret = ret_images[data_id_int]
+        assert dis_row['data_id'] == row_train['data_id'] and dis_row['data_id'] == row_ret['question_id']
+        top = row_ret['ret_images']
+        top = [e.split('/')[-1].split('.')[0] for e in top]
+        top = top[:30]
+
+        question = row_train['question']
+        qimg = row_train['image']
+        answer = row_train['answer']
+        eval_answer = row_train['answer_eval']
+        gt_ent = oven_image_id_entity_map[row_train['image_id']]
+        gt_answer = random.choice(answer)+processor.tokenizer.eos_token+'\n'
+        #qid = row['data_id']
+
+        inputs, input_lengths, answer_ids, answer_mask, answer_lengths = process_input(processor, [question], [qimg], [gt_answer])
+        teacher_ids = row_train['per_ev_top_ids']
+        teacher_logps = row_train['per_ev_top_logps']
+        for i in range(len(teacher_ids)):
+            pad_pos = teacher_ids[i] == -1
+            teacher_ids[i][pad_pos] = processor.tokenizer.pad_token_id
+        teacher_tails = row_train['per_ev_tail']
+        ret_scores = row_train['scores']
+        ##########
+        top_entity = []
+        identical_gt = []
+        merged_scores = []
+        merged_answers = []
+        for j, id in enumerate(top):
+            try:
+                ret_ent = oven_image_id_entity_map[id]
+            except KeyError:
+                #notfound += 1
+                ret_ent = f'unknown{j}'
+
+            top_entity.append(ret_ent)
+            if ret_ent in train_entities_unique:
+                train_q = row_train['question']
+                train_q_ents = train_entity_query_map[train_q]
+                if ret_ent in train_q_ents:
+                    if ret_ent == gt_ent:
+                        igt = gt_answer
+                    else:
+                        igt = train_qe_combination_to_answer[f'{ret_ent}|{train_q}']
+                        igt = random.choice(igt)
+                    identical_gt.append(igt)
+                else:
+                    identical_gt.append(None)
+            else:
+                identical_gt.append(None)
+
+        identical_gt_ids = tokenize_with_none(processor.tokenizer, identical_gt)
+        extracted = extract_top1_sequences_and_logp(teacher_ids, teacher_logps)
+        teacher_ids = extracted[0]
+        teacher_id_mask = teacher_ids!=151643
+        teacher_ids, teacher_id_mask = append_eos_to_padded(teacher_ids, teacher_id_mask, 198,151643)
+        
+        # TODO: Replace teacher id to true GT here, then merge
+        gt_and_teacher_ids, _ =  merge_rows_from_tok_or_original(teacher_ids, teacher_id_mask, identical_gt_ids['input_ids'], identical_gt_ids['input_ids']!=151643,pad_id=151643)
+        gt_and_teacher_ids = trim_excess_right_padding(gt_and_teacher_ids, 151643)
+
+
+        cand_texts = processor.batch_decode(gt_and_teacher_ids, skip_special_tokens=True)
+        counts_mask = (gt_and_teacher_ids == 151643).sum(dim=1)
+        cand_length = gt_and_teacher_ids.size(1) - counts_mask
+        has_abst = torch.tensor([_contains_abstention(e, _ABSTENTION_PATTERNS) for e in cand_texts], dtype=torch.bool)
+        too_long = cand_length > 30
+
+        invalid_cand = torch.logical_or(has_abst, too_long)
+        if invalid_cand.any():
+            ic = invalid_cand.sum()
+            if ic.item() > gt_and_teacher_ids.size(0)//2:
+                return None
+        
+        #merged_teacher_ids = 
+
+        merged = merge_identical_question_answers(top_entity, gt_and_teacher_ids, gt_and_teacher_ids!=151643, ret_scores, invalid_cand, "sum")
+        gt_is_ranked_top, gt_rank, top_weight, merged_scores = label_candidate(
+            cand_tokens=merged['selected_answer_ids'],
+            gt=eval_answer,
+            retrieval_sims_raw=merged['selected_score'],
+            teacher_conf_raw=None,
+            candidate_mask=torch.ones_like(merged['selected_score'],dtype=torch.bool),
+            pad_id=151643,
+            eos_id=151645,
+            score_func=score_infoseek,
+            tokenizer=processor.tokenizer,
+            tau_retrieval=args.ret_tau,
+        )
+        if len(merged["selected_entity"]) == 0:
+            return None
+        return {'data_id': data_id, 'cand_tokens': merged['selected_answer_ids'], 'ret_scores': merged['selected_score'], 'keep': gt_rank<2, 'candidate_gt_rank':gt_rank, 'candidate_mass': top_weight, 'gt': gt_answer, 'selected_entity': merged['selected_entity']}
+        #return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, gt_and_teacher_ids, teacher_logps, teacher_tails, ret_scores, row['answer_eval'], row['data_id']
+
+    
+    train_dl = DataLoader(distill_ds, batch_size=1, shuffle=False, collate_fn=collate_new_distill, prefetch_factor=2, num_workers=12)
+
+    # for i, batch in tqdm(enumerate(train_dl)):
+    #     if batch is None:
+    #         continue
+    #     batch['data_id']
+    # return
     from datasets import Features, Sequence, Value 
     features = Features({
         "data_id": Value("string"),
         "cand_tokens": Sequence(Sequence(Value("int64"))),
         "ret_scores": Sequence(Value("float32")),
-        "sum_cand_logps": Sequence(Value("float32")),
-        "candidate_mask": Sequence(Value("bool")),
-        "m_first_tok_id": Sequence(Sequence(Value("int64"))),
-        "m_first_tok_logp": Sequence(Sequence(Value("float32"))),
-        "m_first_tok_tail": Sequence(Value("float32")),
+        #"sum_cand_logps": Sequence(Value("float32")),
+        #"candidate_mask": Sequence(Value("bool")),
+        #"m_first_tok_id": Sequence(Sequence(Value("int64"))),
+        #"m_first_tok_logp": Sequence(Sequence(Value("float32"))),
+        #"m_first_tok_tail": Sequence(Value("float32")),
         "keep": Value("bool"),
         "candidate_gt_rank": Value("int64"),
         "candidate_mass": Value("float32"),
         "gt": Value("string"),
+        "selected_entity": Sequence(Value("string"))
     })
 
-    train_dl = DataLoader(train_ds, batch_size=1, shuffle=False, collate_fn=collate_train_raw, prefetch_factor=2, num_workers=6)
+    def gen():
+        mean_rank = []
+        mean_weight = []
+        mean_sup = []
+        for batch in tqdm(train_dl):
+            if batch is None:
+                continue
+            mean_rank.append(batch['candidate_gt_rank'])
+            mean_weight.append(batch['candidate_mass'])
+            mean_sup.append(batch['cand_tokens'].size(0))
+            yield batch
+        
+        print("Finished generating DS")
+        print(f"Mean GT rank: {np.mean(mean_rank)}")
+        print(f"{np.histogram(mean_rank)}\n")
+        print(f"Mean GT mass: {np.mean(mean_weight)}")
+        print(f"{np.histogram(mean_weight)}\n")
+        print(f"Mean support: {np.mean(mean_sup)}")
+        print(f"{np.histogram(mean_sup)}\n")
+        print(f"Number of samples has wrong ret shape: {SLICED_RET}")
+    
+    #train_dl = DataLoader(train_ds, batch_size=1, shuffle=False, collate_fn=collate_train_raw) #, prefetch_factor=2, num_workers=6)
 
-    distil_dataset = HFDataset.from_generator(gen, features=features, gen_kwargs={'input_ds': train_dl, 'processor':processor, 'device': "cpu"})
-    distil_dataset.save_to_disk('/data_external/InfoSeek/distill_train')
+    distil_dataset = HFDataset.from_generator(gen, features=features)# gen_kwargs={'input_ds': train_dl, 'processor':processor, 'device': "cpu"})
+    distil_dataset.save_to_disk('/data_external/InfoSeek/distill_withgt')
     return
     # k=30, t=1 avg_w=0.485 avg_topgt_w=0.647 avg_r=1.89
     # k=20, t=1 avg_w=0.514 avg_topgt_w=0.670 avg_r=1.72
@@ -585,19 +1049,32 @@ def main():
     #print(len(distill_pos))
     #return
     #train_ds = train_ds.remove_columns(["per_ev_top_ids", "per_ev_top_logps", "per_ev_tail"])
-    train_ds_ids = train_ds['data_id']
-    train_ds_id_map = {e: i for i,e in tqdm(enumerate(train_ds_ids), total=len(train_ds_ids))}
-    torch.save(train_ds_id_map, '/data_external/video/datasets/MPM/train_ds_id_map.pt')
-    #train_ds_id_map = torch.load('/data_external/video/datasets/MPM/train_ds_id_map.pt')
-
+    #train_ds_ids = train_ds['data_id']
+    #train_ds_id_map = {e: i for i,e in tqdm(enumerate(train_ds_ids), total=len(train_ds_ids))}
+    #torch.save(train_ds_id_map, '/data_external/video/datasets/MPM/train_ds_id_map.pt')
+    train_ds_id_map = torch.load('/data_external/video/datasets/MPM/train_ds_id_map.pt')
+    #distill_pos = train_distill.filter(lambda x: x['keep'] == True)
+    selected_id = train_distill['data_id']
+    distill_new = datasets.load_from_disk('/data_external/video/datasets/MPM/distill_new').with_format('torch')
+    dn_idmap = {v: k for k,v in enumerate(distill_new['data_id'])}
+    select_new = []
+    for id in selected_id:
+        try:
+            idx = dn_idmap[id]
+        except KeyError:
+            continue
+        select_new.append(idx)
+    train_distill = distill_new.select(select_new)
+    train_ds = train_ds.remove_columns(["per_ev_top_ids", "per_ev_top_logps", "per_ev_tail"])
     # train_select = train_distill['data_id']
     # train_select = [train_ds_id_map[e] for e in train_select]
 
     #train_ds = train_ds.cast_column("image", HFImage(decode=True))
     #train_ds = train_ds.select(range(100000))
-    test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_combined').with_format('torch')
-    #test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_full').with_format('torch')
-    #test_ds = test_ds.filter(lambda x: x['utype'] == 'val_unseen_entity') #val_unseen_question
+    #test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_combined').with_format('torch')
+    test_ds = datasets.load_from_disk('/data_external/InfoSeek/val_full').with_format('torch')
+    test_ds = test_ds.filter(lambda x: x['utype'] == 'val_unseen_question') # val_unseen_entity
+    # UE 54964 , UQ 18656, total 73620
     #test_ds = test_ds.select(range(5000))
 
     base_model = Qwen3VLForConditionalGeneration.from_pretrained("/data_external/video/models/Qwen3-VL-8B-Instruct", local_files_only=True, attn_implementation="flash_attention_3", dtype=torch.bfloat16, device_map='cuda')
@@ -612,8 +1089,8 @@ def main():
     # for p in memory.parameters():
     #     p.requires_grad_(True)
 
-    # print(next(memory.parameters()).device)
-    # print(sum(p.numel() for p in memory.parameters()) / 1e9, "B params")
+    #print(next(memory.parameters()).device)
+    print(sum(p.numel() for p in memory.parameters()) / 1e9, "B params")
 
     # saved_dict = torch.load('/data_external/video/codes/MPM/checkpoints/kd_05_k30_t05.pt')
     # memory.load_state_dict(saved_dict, strict=True)
@@ -645,7 +1122,8 @@ def main():
         question = row['question']
         qimg = row['image']
         answers = row['answer']
-        longest_answers = [max(answer, key=len)+processor.tokenizer.eos_token+'\n' for answer in answers]
+        #longest_answers = [max(answer, key=len)+processor.tokenizer.eos_token+'\n' for answer in answers]
+        longest_answers = distill_row['gt']
         #qid = row['data_id']
 
         inputs, input_lengths, answer_ids, answer_mask, answer_lengths = process_input(processor, question, qimg, longest_answers)
@@ -659,7 +1137,9 @@ def main():
         # teacher_tails = row['per_ev_tail']
         # ret_scores = row['scores']
         #return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores, row['answer_eval'], row['data_id']
-        return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, row['answer_eval'], row['data_id'], distill_row['cand_tokens'], distill_row['ret_scores'], distill_row['sum_cand_logps'], distill_row['candidate_mask'], distill_row['m_first_tok_id'], distill_row['m_first_tok_logp'], distill_row['m_first_tok_tail'], 
+        cand_tokens =  distill_row['cand_tokens']
+        cand_tokens = [trim_excess_right_padding(e, 151643) for e in cand_tokens]
+        return inputs, input_lengths, answer_ids, answer_mask, answer_lengths, row['answer_eval'], row['data_id'], cand_tokens, distill_row['ret_scores'], #distill_row['sum_cand_logps'], distill_row['candidate_mask'], distill_row['m_first_tok_id'], distill_row['m_first_tok_logp'], distill_row['m_first_tok_tail'], 
 
     def collate_eval(batch):
         row = {k: [e[k] for e in batch] for k in batch[0].keys()}
@@ -668,8 +1148,8 @@ def main():
         base_inputs = process_input_test(processor, question, qimg).to(model.device)
         return base_inputs, row['answer_eval'], row['data_id']
 
-    train_dl = DataLoader(train_distill, batch_size=MACRO_BATCH_SIZE, shuffle=True, collate_fn=collate_train, num_workers=5, prefetch_factor=2,)
-    
+    train_dl = DataLoader(train_distill, batch_size=MACRO_BATCH_SIZE, shuffle=True, collate_fn=collate_train)#, num_workers=5, prefetch_factor=2,)
+
     #train_dl = DataLoader(train_ds, batch_size=1, shuffle=True, collate_fn=collate_train_raw)
     # import re
     # judge_model = Qwen3ForCausalLM.from_pretrained('/data_external/Qwen3-4B-Instruct-2507', local_files_only=True, attn_implementation="flash_attention_2", dtype=torch.bfloat16, device_map='cuda')
@@ -702,7 +1182,7 @@ def main():
     #     stats.append([has_correct, rank])
     #     pass
     #train_dl.__iter__().__next__()
-    test_dl = DataLoader(test_ds, batch_size=4, collate_fn=collate_eval,) #num_workers=5, prefetch_factor=2,)
+    test_dl = DataLoader(test_ds, batch_size=10, collate_fn=collate_eval,) #num_workers=5, prefetch_factor=2,)
 
     
     num_warmup_steps = 200
@@ -726,7 +1206,7 @@ def main():
         find_unused_parameters=True,
         static_graph=False,
     )
-    accel = Accelerator(kwargs_handlers=[ddp], gradient_accumulation_steps=2)
+    accel = Accelerator(kwargs_handlers=[ddp], gradient_accumulation_steps=1, cpu=True)
     model, optimizer,scheduler, train_dl, test_dl = accel.prepare(model, optimizer, scheduler, train_dl, test_dl)
 
     unw_model = accel.unwrap_model(model)
@@ -734,7 +1214,7 @@ def main():
     
     no_tea = "notea" if args.no_tea else ""
     if accel.is_main_process:
-       wandb_run = wandb.init(project="MMMem", name=f"CEKD_t{args.ret_tau}_k{args.top_k}_shrink_ce_lr{args.lr}")
+       wandb_run = wandb.init(project="MMMem", name=f"gt_ent_t{args.ret_tau}_k{args.top_k}_lr{args.lr}")
 
     # accel.wait_for_everyone()
     # model.eval()
@@ -785,11 +1265,11 @@ def main():
     # gathered_results_mix = []
     # print('UE')
     # with torch.inference_mode():
-    #     for lam in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+    #     #for lam in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
     #         correct = torch.tensor(0., device=model.device)
     #         for row in tqdm(test_dl):
     #             inputs, gts, data_ids = row
-    #             output_ids = unw_model.generate(**inputs, mix_mode='mix', mix_lambda=lam, branch="generation")
+    #             output_ids = unw_model.generate(**inputs, mix_mode='base', mix_lambda=0.6, branch="generation")
     #             input_len = inputs.input_ids.size(1)
     #             generated_ids = output_ids[:, input_len:]
     #             text = processor.batch_decode(generated_ids, skip_special_tokens=True)
@@ -816,8 +1296,8 @@ def main():
     #         correct = accel.reduce(correct, reduction="sum")
     #         if accel.is_main_process:
     #             correct = correct.item()
-    #             gathered_results_mix.sort(key=lambda x: x["data_id"])
-    #             print(f'Lambda: {lam}')
+    #             #gathered_results_mix.sort(key=lambda x: x["data_id"])
+    #             #print(f'Lambda: {lam}')
     #             print(correct)
     #             print(correct / len(test_ds))
     #             print()
@@ -857,9 +1337,10 @@ def main():
         support = 0
         for step, batch in enumerate(train_dl):
             #inputs, input_lengths, answer_ids, answer_mask, answer_lengths, teacher_ids, teacher_logps, teacher_tails, ret_scores = batch
-            inputs, input_lengths, answer_ids, answer_mask, answer_lengths, answer_eval, data_id, cand_tokens, ret_scores, sum_cand_logps, candidate_mask, m_first_tok_id, m_first_tok_logp, m_first_tok_tail = batch
+            #inputs, input_lengths, answer_ids, answer_mask, answer_lengths, answer_eval, data_id, cand_tokens, ret_scores#, sum_cand_logps, candidate_mask, m_first_tok_id, m_first_tok_logp, m_first_tok_tail = batch
+            inputs, input_lengths, answer_ids, answer_mask, answer_lengths, answer_eval, data_id, cand_tokens, ret_scores = batch
             #stats = train_step(model,unw_model.config, accel, processor, optimizer,scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  teacher_ids, teacher_logps, teacher_tails, ret_scores)
-            stats = train_step_temperature(model,unw_model.config, accel, processor, optimizer, scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  cand_tokens, ret_scores, sum_cand_logps,m_first_tok_id, m_first_tok_logp, m_first_tok_tail, candidate_mask, mode="seqkd")
+            stats = train_step_temperature(model,unw_model.config, accel, processor, optimizer, scheduler, model.device, inputs, input_lengths, answer_ids, answer_mask,  cand_tokens, ret_scores, mode="seqkd")
             
             acc_loss.append(stats['loss'])
             cur_loss = np.mean(acc_loss)
